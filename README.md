@@ -1,3 +1,5 @@
+![ShellCheck](https://github.com/Nima786/iptables-firewall-manager/actions/workflows/main.yml/badge.svg)
+
 ## Quick Install
 
 ```bash
