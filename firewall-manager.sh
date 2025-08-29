@@ -2,10 +2,11 @@
 set -euo pipefail
 
 # =================================================================
-#        Interactive NFTABLES Firewall Manager - v5.6 (Definitive)
+#        Interactive NFTABLES Firewall Manager - v5.8 (Definitive)
 # =================================================================
-# v5.6: Fixed a bug that caused the script to exit silently if a
-#       config file was missing when applying rules.
+# A menu-driven utility to manage a modern nftables firewall.
+# v5.8: Fixed critical hang bug when reading files without a final
+#       newline. Restored full menu functionality.
 
 # --- CONFIGURATION ---
 CONFIG_DIR="/etc/firewall_manager_nft"
@@ -90,44 +91,47 @@ function apply_rules() {
     if [[ "$no_pause" == false ]]; then clear; fi
     echo "[+] Building new nftables ruleset..."
 
-    # --- SAFETY CHECK: Ensure config files exist before reading ---
     [ ! -f "$ALLOWED_TCP_PORTS_FILE" ] && touch "$ALLOWED_TCP_PORTS_FILE"
     [ ! -f "$ALLOWED_UDP_PORTS_FILE" ] && touch "$ALLOWED_UDP_PORTS_FILE"
     [ ! -f "$BLOCKED_IPS_FILE" ] && touch "$BLOCKED_IPS_FILE"
-    # --- END SAFETY CHECK ---
-
+    
     local ssh_port; ssh_port=$(detect_ssh_port)
     local tcp_ports; tcp_ports=$(sort -un "$ALLOWED_TCP_PORTS_FILE" | grep -v "^${ssh_port}$" | tr '\n' ',' | sed 's/,$//')
     local udp_ports; udp_ports=$(sort -un "$ALLOWED_UDP_PORTS_FILE" | tr '\n' ',' | sed 's/,$//')
     
-    local ruleset="flush ruleset\n"
-    ruleset+="table inet firewall-manager {\n"
-    ruleset+="\tchain input {\n"
-    ruleset+="\t\ttype filter hook input priority 0; policy drop;\n"
-    ruleset+="\t\tct state { established, related } accept\n"
-    ruleset+="\t\tiif lo accept\n"
-    ruleset+="\t\tct state invalid drop\n"
-    ruleset+="\t\ttcp dport ${ssh_port} accept\n"
-    if [[ -n "$tcp_ports" ]]; then ruleset+="\t\ttcp dport { ${tcp_ports} } accept\n"; fi
-    if [[ -n "$udp_ports" ]]; then ruleset+="\t\tudp dport { ${udp_ports} } accept\n"; fi
-    ruleset+="\t}\n\n"
-    ruleset+="\tchain forward {\n"
-    ruleset+="\t\ttype filter hook forward priority 0; policy drop;\n"
-    while IFS= read -r line; do
-        line=$(echo "$line" | tr -d '\r' | xargs); [[ "$line" =~ ^#.* ]] || [[ -z "$line" ]] && continue
-        ruleset+="\t\tip daddr ${line} drop\n"
+    local blocklist_rules=""
+    # CORRECTED: Robust while loop that doesn't hang on files without a final newline
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=$(echo "$line" | tr -d '\r' | xargs)
+        [[ "$line" =~ ^#.* ]] || [[ -z "$line" ]] && continue
+        blocklist_rules+="ip daddr ${line} drop\n"
     done < "$BLOCKED_IPS_FILE"
-    ruleset+="\t}\n\n"
-    ruleset+="\tchain output {\n"
-    ruleset+="\t\ttype filter hook output priority 0; policy accept;\n"
-    while IFS= read -r line; do
-        line=$(echo "$line" | tr -d '\r' | xargs); [[ "$line" =~ ^#.* ]] || [[ -z "$line" ]] && continue
-        ruleset+="\t\tip daddr ${line} drop\n"
-    done < "$BLOCKED_IPS_FILE"
-    ruleset+="\t}\n"
-    ruleset+="}\n"
 
-    if echo -e "$ruleset" | nft -f -; then
+    local ruleset_content
+    ruleset_content=$(cat <<-EOF
+        table inet firewall-manager {
+            chain input {
+                type filter hook input priority 0; policy drop;
+                ct state { established, related } accept
+                iif lo accept
+                ct state invalid drop
+                tcp dport ${ssh_port} accept
+                $(if [[ -n "$tcp_ports" ]]; then echo "tcp dport { ${tcp_ports} } accept"; fi)
+                $(if [[ -n "$udp_ports" ]]; then echo "udp dport { ${udp_ports} } accept"; fi)
+            }
+            chain forward {
+                type filter hook forward priority 0; policy drop;
+                ${blocklist_rules}
+            }
+            chain output {
+                type filter hook output priority 0; policy accept;
+                ${blocklist_rules}
+            }
+        }
+EOF
+    )
+
+    if echo "flush ruleset" | nft -f - && echo "$ruleset_content" | nft -f -; then
         echo -e "\n${GREEN}Firewall configuration applied successfully!${NC}"; echo -e "${YELLOW}Saving rules to make them persistent...${NC}"
         nft list ruleset > /etc/nftables.conf; systemctl restart nftables.service
         echo -e "${GREEN}Rules have been made persistent.${NC}"
@@ -202,9 +206,30 @@ function manage_udp_ports_menu() {
     done
 }
 
-function manage_ips_menu() {
-    echo -e "\n${YELLOW}This feature is still under development for the nftables version.${NC}"
+function add_item() {
+    local file="$1"; local item_type="$2"; local validation_regex="$3"; local error_message="$4"
+    clear; echo -e "${YELLOW}--- Add a new ${item_type} to the configuration ---${NC}"; echo "Current list:"; grep -v '^#' "$file" | grep .; echo ""
+    read -r -p "Enter the new ${item_type} to add: " item < /dev/tty
+    if [[ "$item" =~ $validation_regex ]]; then echo "$item" >> "$file"; echo -e "${GREEN}${item_type^} '$item' added.${NC}"; prompt_to_apply;
+    else echo -e "${RED}${error_message}${NC}"; fi
     press_enter_to_continue
+}
+
+function remove_item() {
+    local file="$1"; local item_type="$2"
+    clear; echo -e "${YELLOW}--- Remove a ${item_type} from the configuration ---${NC}"; echo "Current list:"; grep -v '^#' "$file" | grep .; echo ""
+    read -r -p "Enter the ${item_type} to remove: " item < /dev/tty
+    if grep -qFx "$item" "$file"; then
+        local temp_file=$(mktemp); grep -vFx "$item" "$file" > "$temp_file"; mv "$temp_file" "$file"
+        echo -e "${GREEN}${item_type^} '$item' removed.${NC}"; prompt_to_apply
+    else echo -e "${RED}${item_type^} '$item' not found.${NC}"; fi
+    press_enter_to_continue
+}
+
+function manage_ips_menu() {
+    while true; do clear; echo "--- Manage Blocked IPs ---"; echo "1) Add IP/CIDR"; echo "2) Remove IP/CIDR"; echo "3) Back"; read -r -p "Choose an option: " choice < /dev/tty
+        case $choice in 1) add_item "$BLOCKED_IPS_FILE" "IP/CIDR" '^[0-9./]+$' "Invalid format." ;; 2) remove_item "$BLOCKED_IPS_FILE" "IP/CIDR" ;; 3) break ;; *) echo -e "${RED}Invalid option.${NC}" && sleep 1 ;; esac
+    done
 }
 
 function flush_rules() {
@@ -231,8 +256,8 @@ function uninstall_script() {
 
 function main_menu() {
     while true; do
-        clear; echo "==============================="; echo " NFTABLES FIREWALL MANAGER v5.6"; echo "==============================="
-        echo "1) View Current Firewall Rules"; echo "2) Apply Firewall Rules from Config"; echo "3) Manage Allowed TCP Ports"; echo "4) Manage Allowed UDP Ports"; echo "5) Manage Blocked IPs (WIP)"; echo "6) Update IP Blocklist from Source"; echo "7) Flush All Rules & Reset Config"; echo "8) Uninstall Firewall & Script"; echo "9) Exit"
+        clear; echo "==============================="; echo " NFTABLES FIREWALL MANAGER v5.8"; echo "==============================="
+        echo "1) View Current Firewall Rules"; echo "2) Apply Firewall Rules from Config"; echo "3) Manage Allowed TCP Ports"; echo "4) Manage Allowed UDP Ports"; echo "5) Manage Blocked IPs"; echo "6) Update IP Blocklist from Source"; echo "7) Flush All Rules & Reset Config"; echo "8) Uninstall Firewall & Script"; echo "9) Exit"
         echo "-------------------------------"; read -r -p "Choose an option: " choice < /dev/tty
         case $choice in 1) view_rules ;; 2) apply_rules ;; 3) manage_tcp_ports_menu ;; 4) manage_udp_ports_menu ;; 5) manage_ips_menu ;; 6) update_blocklist; press_enter_to_continue ;; 7) flush_rules ;; 8) uninstall_script ;; 9) exit 0 ;; *) echo -e "${RED}Invalid option.${NC}" && sleep 1 ;; esac
     done
