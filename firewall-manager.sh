@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # =================================================================
-#        Interactive NFTABLES Firewall Manager - v5.4 (Definitive)
+#        Interactive NFTABLES Firewall Manager - v5.5 (Definitive)
 # =================================================================
-# v5.4: Fixed script exiting prematurely after port management due to
-#       a bad Docker check. Fixed duplicated SSH port rule.
+# A menu-driven utility to manage a modern nftables firewall.
+# v5.5: Removed an unused variable to pass ShellCheck linting.
 
 # --- CONFIGURATION ---
 CONFIG_DIR="/etc/firewall_manager_nft"
@@ -91,10 +91,8 @@ function apply_rules() {
     echo "[+] Building new nftables ruleset..."
 
     local ssh_port; ssh_port=$(detect_ssh_port)
-    # Read ports from files, ensuring the SSH port is excluded to prevent duplication
     local tcp_ports; tcp_ports=$(sort -un "$ALLOWED_TCP_PORTS_FILE" | grep -v "^${ssh_port}$" | tr '\n' ',' | sed 's/,$//')
     local udp_ports; udp_ports=$(sort -un "$ALLOWED_UDP_PORTS_FILE" | tr '\n' ',' | sed 's/,$//')
-    local blocked_ips; blocked_ips=$(grep -v '^#' "$BLOCKED_IPS_FILE" | grep . | tr '\n' ',' | sed 's/,$//')
     
     local ruleset="flush ruleset\n"
     ruleset+="table inet firewall-manager {\n"
@@ -103,7 +101,7 @@ function apply_rules() {
     ruleset+="\t\tct state { established, related } accept\n"
     ruleset+="\t\tiif lo accept\n"
     ruleset+="\t\tct state invalid drop\n"
-    ruleset+="\t\ttcp dport ${ssh_port} accept\n" # Hardcoded safety rule
+    ruleset+="\t\ttcp dport ${ssh_port} accept\n"
     if [[ -n "$tcp_ports" ]]; then ruleset+="\t\ttcp dport { ${tcp_ports} } accept\n"; fi
     if [[ -n "$udp_ports" ]]; then ruleset+="\t\tudp dport { ${udp_ports} } accept\n"; fi
     ruleset+="\t}\n\n"
@@ -147,7 +145,8 @@ function parse_and_process_ports() {
     for item in "${port_items[@]}"; do
         item=$(echo "$item" | xargs)
         if [[ "$item" == *-* ]]; then
-            local start_port; start_port=$(echo "$item" | cut -d'-' -f1); local end_port; end_port=$(echo "$item" | cut -d'-' -f2)
+            local start_port; start_port=$(echo "$item" | cut -d'-' -f1)
+            local end_port; end_port=$(echo "$item" | cut -d'-' -f2)
             if [[ "$start_port" =~ ^[0-9]+$ && "$end_port" =~ ^[0-9]+$ && "$start_port" -le "$end_port" ]]; then
                 for ((port=start_port; port<=end_port; port++)); do
                     if [[ "$action" == "remove" && "$port" == "$ssh_port" && "$proto_file" == "$ALLOWED_TCP_PORTS_FILE" ]]; then continue; fi
@@ -227,7 +226,7 @@ function uninstall_script() {
 
 function main_menu() {
     while true; do
-        clear; echo "==============================="; echo " NFTABLES FIREWALL MANAGER v5.4"; echo "==============================="
+        clear; echo "==============================="; echo " NFTABLES FIREWALL MANAGER v5.5"; echo "==============================="
         echo "1) View Current Firewall Rules"; echo "2) Apply Firewall Rules from Config"; echo "3) Manage Allowed TCP Ports"; echo "4) Manage Allowed UDP Ports"; echo "5) Manage Blocked IPs (WIP)"; echo "6) Update IP Blocklist from Source"; echo "7) Flush All Rules & Reset Config"; echo "8) Uninstall Firewall & Script"; echo "9) Exit"
         echo "-------------------------------"; read -r -p "Choose an option: " choice < /dev/tty
         case $choice in 1) view_rules ;; 2) apply_rules ;; 3) manage_tcp_ports_menu ;; 4) manage_udp_ports_menu ;; 5) manage_ips_menu ;; 6) update_blocklist; press_enter_to_continue ;; 7) flush_rules ;; 8) uninstall_script ;; 9) exit 0 ;; *) echo -e "${RED}Invalid option.${NC}" && sleep 1 ;; esac
