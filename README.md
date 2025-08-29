@@ -19,7 +19,8 @@
 curl -fsSL https://raw.githubusercontent.com/Nima786/iptables-firewall-manager/main/firewall-manager.sh | sudo bash
  ````
 
-This script transforms complex iptables management into a simple, interactive process. It's designed to be robust, user-friendly, and safe, with special considerations for modern environments using Docker.
+This script transforms complex iptables management into a simple, interactive process. It's designed to be robust, user-friendly, and safe, with special considerations for modern environments using **Docker**.
+
 
 <p align="center">
   <img src="https://github.com/Nima786/iptables-firewall-manager/blob/main/assets/firewall-manager.webp" width="600"/>
