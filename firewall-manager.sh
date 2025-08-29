@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =================================================================
-#  Interactive NFTABLES Firewall Manager - v6.5
+#  Interactive NFTABLES Firewall Manager - v6.6
 # =================================================================
 # - First run: apt update && apt upgrade (tracked by state file)
 # - Subsequent runs: quick apt metadata refresh only
@@ -178,7 +178,7 @@ apply_rules(){
     echo
     echo "  chain forward {"
     echo "    type filter hook forward priority 0; policy drop;"
-    # Only source-side drops here (cleaner output; still blocks spoofed scans)
+    # Source-side drops (cleaner; blocks spoofed scans)
     for ip in "${BLOCKED_CLEAN[@]:-}"; do
       echo "    ip saddr ${ip} drop"
     done
@@ -212,43 +212,62 @@ prompt_to_apply(){ apply_rules --no-pause; }  # used after blocklist update
 
 parse_and_process_ports(){
   local action="$1" proto_file="$2" input_ports="$3"
-  local count=0 ssh_port; ssh_port=$(detect_ssh_port)
+  local count=0
+  local ssh_port; ssh_port=$(detect_ssh_port)
+
   IFS=',' read -ra port_items <<< "$input_ports"
   for item in "${port_items[@]}"; do
     item=$(echo "$item" | xargs)
+
     if [[ "$item" == *-* ]]; then
-      local start_port end_port; start_port=${item%-*}; end_port=${item#*-}
+      local start_port end_port
+      start_port=${item%-*}
+      end_port=${item#*-}
       if [[ "$start_port" =~ ^[0-9]+$ && "$end_port" =~ ^[0-9]+$ && "$start_port" -le "$end_port" ]]; then
         for ((port=start_port; port<=end_port; port++)); do
-          if [[ "$action" == "remove" && "$port" == "$ssh_port" && "$proto_file" == "$ALLOWED_TCP_PORTS_FILE" ]]; then continue; fi
-          if [[ "$action" == "add" ]] && ! grep -q "^${port}$" "$proto_file"; then echo "$port" >> "$proto_file"; ((count++));
-          elif [[ "$action" == "remove" ]] && grep -q "^${port}$" "$proto_file"; then sed -i "/^${port}$/d" "$proto_file"; ((count++)); fi
+          if [[ "$action" == "remove" && "$port" == "$ssh_port" && "$proto_file" == "$ALLOWED_TCP_PORTS_FILE" ]]; then
+            continue
+          fi
+          if [[ "$action" == "add" ]] && ! grep -q "^${port}$" "$proto_file"; then
+            echo "$port" >> "$proto_file"; ((count++))
+          elif [[ "$action" == "remove" ]] && grep -q "^${port}$" "$proto_file"; then
+            sed -i "/^${port}$/d" "$proto_file"; ((count++))
+          fi
         done
-        echo -e " -> ${GREEN}Port range $item processed.${NC}"
+        echo -e " -> ${GREEN}Port range $item processed.${NC}" >&2
       else
-        echo -e " -> ${RED}Invalid range: $item${NC}"
+        echo -e " -> ${RED}Invalid range: $item${NC}" >&2
       fi
+
     elif [[ "$item" =~ ^[0-9]+$ ]]; then
       if [[ "$action" == "remove" && "$item" == "$ssh_port" && "$proto_file" == "$ALLOWED_TCP_PORTS_FILE" ]]; then
-        echo -e " -> ${RED}Safety: Cannot remove SSH port (${ssh_port}).${NC}"; continue
+        echo -e " -> ${RED}Safety: Cannot remove SSH port (${ssh_port}).${NC}" >&2
+        continue
       fi
       if [[ "$action" == "add" && "$item" == "$ssh_port" && "$proto_file" == "$ALLOWED_TCP_PORTS_FILE" ]]; then
-        echo -e " -> ${YELLOW}SSH port is already allowed automatically.${NC}"; continue
+        echo -e " -> ${YELLOW}SSH port is already allowed automatically.${NC}" >&2
+        continue
       fi
+
       if [[ "$action" == "add" ]] && ! grep -q "^${item}$" "$proto_file"; then
-        echo "$item" >> "$proto_file"; ((count++)); echo -e " -> ${GREEN}Port $item added.${NC}"
+        echo "$item" >> "$proto_file"; ((count++))
+        echo -e " -> ${GREEN}Port $item added.${NC}" >&2
       elif [[ "$action" == "add" ]]; then
-        echo -e " -> ${YELLOW}Port $item already exists.${NC}"
+        echo -e " -> ${YELLOW}Port $item already exists.${NC}" >&2
       elif [[ "$action" == "remove" ]] && grep -q "^${item}$" "$proto_file"; then
-        sed -i "/^${item}$/d" "$proto_file"; ((count++)); echo -e " -> ${GREEN}Port $item removed.${NC}"
+        sed -i "/^${item}$/d" "$proto_file"; ((count++))
+        echo -e " -> ${GREEN}Port $item removed.${NC}" >&2
       else
-        echo -e " -> ${YELLOW}Port $item not found.${NC}"
+        echo -e " -> ${YELLOW}Port $item not found.${NC}" >&2
       fi
+
     elif [[ -n "$item" ]]; then
-      echo -e " -> ${RED}Invalid input: $item${NC}"
+      echo -e " -> ${RED}Invalid input: $item${NC}" >&2
     fi
   done
-  echo "$count"
+
+  # ONLY the numeric count goes to stdout (caller captures it)
+  printf '%s\n' "$count"
 }
 
 add_ports_interactive(){
@@ -362,7 +381,7 @@ main_menu(){
   while true; do
     clear
     echo "==============================="
-    echo " NFTABLES FIREWALL MANAGER v6.5"
+    echo " NFTABLES FIREWALL MANAGER v6.6"
     echo "==============================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
