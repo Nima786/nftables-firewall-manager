@@ -2,11 +2,11 @@
 set -euo pipefail
 
 # =================================================================
-#        Interactive NFTABLES Firewall Manager - v5.2 (Definitive)
+#        Interactive NFTABLES Firewall Manager - v5.3 (Definitive)
 # =================================================================
-# v5.2: Fixed 'conflicting intervals' error by removing 'flags interval'.
-#       Fixed syntax error when TCP or UDP port list is empty.
-#       These fixes also resolve the script exiting on apply.
+# v5.3: Re-engineered the apply_rules function to use individual rules
+#       instead of a set, providing universal compatibility with any
+#       IP blocklist, even those with overlapping ranges.
 
 # --- CONFIGURATION ---
 CONFIG_DIR="/etc/firewall_manager_nft"
@@ -95,22 +95,24 @@ function apply_rules() {
     local ssh_port; ssh_port=$(detect_ssh_port)
     local tcp_ports; tcp_ports=$(sort -un "$ALLOWED_TCP_PORTS_FILE" | tr '\n' ',' | sed 's/,$//')
     local udp_ports; udp_ports=$(sort -un "$ALLOWED_UDP_PORTS_FILE" | tr '\n' ',' | sed 's/,$//')
-    local blocked_ips; blocked_ips=$(grep -v '^#' "$BLOCKED_IPS_FILE" | grep . | tr '\n' ',' | sed 's/,$//')
     
+    # Generate the blocklist rules as a multi-line string
+    local blocklist_rules=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=$(echo "$line" | tr -d '\r' | xargs)
+        [[ "$line" =~ ^#.* ]] || [[ -z "$line" ]] && continue
+        blocklist_rules+="ip daddr ${line} drop\n"
+    done < "$BLOCKED_IPS_FILE"
+
     # Begin generating the ruleset as a single string
     local ruleset="flush ruleset\n"
     ruleset+="table inet firewall-manager {\n"
-    ruleset+="\tset abuse_defender_ipv4 {\n"
-    ruleset+="\t\ttype ipv4_addr\n" # FIX: Removed 'flags interval' to allow for overlapping IPs from source
-    ruleset+="\t\telements = { ${blocked_ips:-} }\n"
-    ruleset+="\t}\n\n"
     ruleset+="\tchain input {\n"
     ruleset+="\t\ttype filter hook input priority 0; policy drop;\n"
     ruleset+="\t\tct state { established, related } accept\n"
     ruleset+="\t\tiif lo accept\n"
     ruleset+="\t\tct state invalid drop\n"
     ruleset+="\t\ttcp dport ${ssh_port} accept\n"
-    # FIX: Only add rules if ports are defined
     if [[ -n "$tcp_ports" ]]; then
         ruleset+="\t\ttcp dport { ${tcp_ports} } accept\n"
     fi
@@ -120,11 +122,11 @@ function apply_rules() {
     ruleset+="\t}\n\n"
     ruleset+="\tchain forward {\n"
     ruleset+="\t\ttype filter hook forward priority 0; policy drop;\n"
-    ruleset+="\t\tip daddr @abuse_defender_ipv4 drop\n"
+    ruleset+="${blocklist_rules}" # Inject blocklist rules here
     ruleset+="\t}\n\n"
     ruleset+="\tchain output {\n"
     ruleset+="\t\ttype filter hook output priority 0; policy accept;\n"
-    ruleset+="\t\tip daddr @abuse_defender_ipv4 drop\n"
+    ruleset+="${blocklist_rules}" # And here
     ruleset+="\t}\n"
     ruleset+="}\n"
 
@@ -165,7 +167,7 @@ function parse_and_process_ports() {
             if [[ "$action" == "remove" && "$item" == "$ssh_port" && "$proto_file" == "$ALLOWED_TCP_PORTS_FILE" ]]; then echo -e " -> ${RED}Safety active: Cannot remove SSH port.${NC}"; continue; fi
             if [[ "$action" == "add" ]] && ! grep -q "^${item}$" "$proto_file"; then echo "$item" >> "$proto_file"; ((count++)); echo -e " -> ${GREEN}Port $item added.${NC}";
             elif [[ "$action" == "add" ]]; then echo -e " -> ${YELLOW}Port $item already exists.${NC}";
-            elif [[ "$action" == "remove" ]] && grep -q "^${port}$" "$proto_file"; then sed -i "/^${item}$/d" "$proto_file"; ((count++)); echo -e " -> ${GREEN}Port $item removed.${NC}";
+            elif [[ "$action" == "remove" ]] && grep -q "^${item}$" "$proto_file"; then sed -i "/^${item}$/d" "$proto_file"; ((count++)); echo -e " -> ${GREEN}Port $item removed.${NC}";
             elif [[ "$action" == "remove" ]]; then echo -e " -> ${YELLOW}Port $item not found in config.${NC}"; fi
         elif [[ -n "$item" ]]; then echo -e " -> ${RED}Invalid input: $item${NC}"; fi
     done
@@ -233,7 +235,7 @@ function uninstall_script() {
 
 function main_menu() {
     while true; do
-        clear; echo "==============================="; echo " NFTABLES FIREWALL MANAGER v5.2"; echo "==============================="
+        clear; echo "==============================="; echo " NFTABLES FIREWALL MANAGER v5.3"; echo "==============================="
         echo "1) View Current Firewall Rules"; echo "2) Apply Firewall Rules from Config"; echo "3) Manage Allowed TCP Ports"; echo "4) Manage Allowed UDP Ports"; echo "5) Manage Blocked IPs (WIP)"; echo "6) Update IP Blocklist from Source"; echo "7) Flush All Rules & Reset Config"; echo "8) Uninstall Firewall & Script"; echo "9) Exit"
         echo "-------------------------------"; read -r -p "Choose an option: " choice < /dev/tty
         case $choice in 1) view_rules ;; 2) apply_rules ;; 3) manage_tcp_ports_menu ;; 4) manage_udp_ports_menu ;; 5) manage_ips_menu ;; 6) update_blocklist; press_enter_to_continue ;; 7) flush_rules ;; 8) uninstall_script ;; 9) exit 0 ;; *) echo -e "${RED}Invalid option.${NC}" && sleep 1 ;; esac
@@ -242,6 +244,6 @@ function main_menu() {
 
 # --- SCRIPT START ---
 if [ "$(id -u)" -ne 0 ]; then echo -e "${RED}This script must be run as root. Please use sudo.${NC}" >&2; exit 1; fi
-# check_dependencies # Assuming dependencies are installed for now
+check_dependencies
 initial_setup
 main_menu
