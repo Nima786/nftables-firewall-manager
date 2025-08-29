@@ -2,11 +2,11 @@
 set -euo pipefail
 
 # =================================================================
-#        Interactive NFTABLES Firewall Manager - v5.0 (Definitive)
+#        Interactive NFTABLES Firewall Manager - v5.1 (Definitive)
 # =================================================================
 # A menu-driven utility to manage a modern nftables firewall.
-# v5.0: Feature-complete release. Re-implements the full interactive
-#       menu system and fixes all shellcheck warnings.
+# v5.1: Fixed "unbound variable" error in apply_rules function
+#       when called from the main menu.
 
 # --- CONFIGURATION ---
 CONFIG_DIR="/etc/firewall_manager_nft"
@@ -87,7 +87,12 @@ function initial_setup() {
 }
 
 function apply_rules() {
-    local no_pause=false; if [[ "$1" == "--no-pause" ]]; then no_pause=true; fi
+    local no_pause=false
+    # CORRECTED: Use default empty string if $1 is not set, to prevent "unbound variable" error
+    if [[ "${1:-}" == "--no-pause" ]]; then
+        no_pause=true
+    fi
+
     if [[ "$no_pause" == false ]]; then clear; fi
     echo "[+] Building new nftables ruleset..."
 
@@ -119,13 +124,11 @@ function apply_rules() {
             chain forward {
                 type filter hook forward priority 0; policy drop;
                 ip daddr @abuse_defender_ipv4 drop
-                # Add ip6 daddr for IPv6 blocklist set here in the future
             }
 
             chain output {
                 type filter hook output priority 0; policy accept;
                 ip daddr @abuse_defender_ipv4 drop
-                 # Add ip6 daddr for IPv6 blocklist set here in the future
             }
         }
 EOF
@@ -205,10 +208,8 @@ function manage_udp_ports_menu() {
 }
 
 function manage_ips_menu() {
-    # This uses simplified add/remove_item functions for brevity. Can be expanded if needed.
-    while true; do clear; echo "--- Manage Blocked IPs ---"; echo "1) Add IP/CIDR"; echo "2) Remove IP/CIDR"; echo "3) Back"; read -r -p "Choose an option: " choice < /dev/tty
-        case $choice in 1) echo "Not yet implemented"; press_enter_to_continue ;; 2) echo "Not yet implemented"; press_enter_to_continue ;; 3) break ;; *) echo -e "${RED}Invalid option.${NC}" && sleep 1 ;; esac
-    done
+    echo -e "\n${YELLOW}This feature is still under development for the nftables version.${NC}"
+    press_enter_to_continue
 }
 
 function flush_rules() {
@@ -225,7 +226,7 @@ function flush_rules() {
 function uninstall_script() {
     clear; echo -e "${RED}--- UNINSTALL FIREWALL & SCRIPT ---${NC}"; read -r -p "ARE YOU SURE you want to permanently delete the firewall and this script? (y/n): " confirm < /dev/tty
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-        echo "[+] Flushing ruleset and setting policy to ACCEPT..."; nft flush ruleset; echo "flush ruleset" > /etc/nftables.conf
+        echo "[+] Flushing ruleset and disabling service..."; nft flush ruleset; echo "flush ruleset" > /etc/nftables.conf
         systemctl restart nftables.service; systemctl disable nftables.service
         echo "[+] Deleting configuration directory..."; rm -rf "$CONFIG_DIR"
         echo -e "${GREEN}Firewall has been removed. The script will now self-destruct.${NC}"
@@ -237,7 +238,7 @@ function uninstall_script() {
 
 function main_menu() {
     while true; do
-        clear; echo "==============================="; echo " NFTABLES FIREWALL MANAGER v5.0"; echo "==============================="
+        clear; echo "==============================="; echo " NFTABLES FIREWALL MANAGER v5.1"; echo "==============================="
         echo "1) View Current Firewall Rules"; echo "2) Apply Firewall Rules from Config"; echo "3) Manage Allowed TCP Ports"; echo "4) Manage Allowed UDP Ports"; echo "5) Manage Blocked IPs"; echo "6) Update IP Blocklist from Source"; echo "7) Flush All Rules & Reset Config"; echo "8) Uninstall Firewall & Script"; echo "9) Exit"
         echo "-------------------------------"; read -r -p "Choose an option: " choice < /dev/tty
         case $choice in 1) view_rules ;; 2) apply_rules ;; 3) manage_tcp_ports_menu ;; 4) manage_udp_ports_menu ;; 5) manage_ips_menu ;; 6) update_blocklist; press_enter_to_continue ;; 7) flush_rules ;; 8) uninstall_script ;; 9) exit 0 ;; *) echo -e "${RED}Invalid option.${NC}" && sleep 1 ;; esac
