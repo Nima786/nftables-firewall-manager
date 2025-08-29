@@ -1,64 +1,55 @@
 #!/bin/bash
 set -euo pipefail
 
-# -------------------- SETTINGS --------------------
+# ======================================================
+#   IPTABLES Firewall Manager – unattended + interactive
+# ======================================================
+
+# -------------------- PATHS --------------------
 CONFIG_DIR="/etc/firewall_manager"
 ALLOWED_TCP_PORTS_FILE="$CONFIG_DIR/allowed_tcp_ports.conf"
 ALLOWED_UDP_PORTS_FILE="$CONFIG_DIR/allowed_udp_ports.conf"
 BLOCKED_IPS_FILE="$CONFIG_DIR/blocked_ips.conf"
+SAVED_SCRIPT="$CONFIG_DIR/firewall-manager.sh"     # offline saved copy
+LAUNCHER="/usr/local/bin/firewall-manager"         # user command
 SSH_PORT="22"
+
+# Remote URLs
+SCRIPT_URL="https://raw.githubusercontent.com/Nima786/iptables-firewall-manager/main/firewall-manager.sh"
 BLOCKLIST_URL="https://raw.githubusercontent.com/Kiya6955/Abuse-Defender/main/abuse-ips.ipv4"
 
 # Colors
 RED="\033[0;31m"; YELLOW="\033[1;33m"; GREEN="\033[0;32m"; NC="\033[0m"
 
-# Mode
-AUTO=false
-for a in "$@"; do
+# Detect if stdin is a pipe (one-liner install)
+PIPED=false; [ ! -t 0 ] && PIPED=true
+
+# Internal switches (the launcher passes --menu; users never type flags)
+FORCE_MENU=false
+for a in "${@:-}"; do
   case "$a" in
-    --auto|--yes|-y) AUTO=true ;;
+    --menu) FORCE_MENU=true ;;
   esac
 done
-# If piped (no TTY), default to AUTO to avoid hangs
-if [ ! -t 0 ]; then AUTO=true; fi
 
 # -------------------- HELPERS --------------------
-press_enter() {
-  if $AUTO; then
-    return
-  else
-    echo
-    read -r -p "Press Enter to return..."
-  fi
-}
-
+press_enter() { echo; read -r -p "Press Enter to return..."; }
 need_bin() { command -v "$1" &>/dev/null; }
 install_pkgs() {
   echo -e "${YELLOW}Installing missing packages (requires apt) ...${NC}"
   apt-get update -y
   DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
 }
-
-# Remove Windows CRs in-place (safe if not present)
 dos2unix_inplace() { sed -i 's/\r$//' "$1"; }
-
-# Return normalized first token of a line (no comment/commas/space/CR); echo empty if nothing
 normalize_ip_token() {
-  # input in $1
   local t="$1"
-  # strip trailing CRs
-  t="${t//$'\r'/}"
-  # drop comments starting with '#'
-  t="${t%%#*}"
-  # cut at whitespace, comma, semicolon
+  t="${t//$'\r'/}"            # strip CR
+  t="${t%%#*}"                # strip comment
   t="${t%% *}"; t="${t%%,*}"; t="${t%%;*}"
-  # trim surrounding spaces
-  t="$(echo "$t" | xargs)"
+  t="$(echo "$t" | xargs)"    # trim
   printf '%s' "$t"
 }
-
 is_valid_ipv4_or_cidr() {
-  # 1.2.3.4 or 1.2.3.4/0-32
   local r='^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]|[12][0-9]|3[0-2]))?$'
   [[ "$1" =~ $r ]]
 }
@@ -100,21 +91,12 @@ update_blocklist() {
 }
 
 # -------------------- CONFIG --------------------
-initial_setup() {
-  if [ -d "$CONFIG_DIR" ]; then return; fi
+initial_setup_noninteractive() {
   echo -e "${YELLOW}Setting up configuration in ${CONFIG_DIR}...${NC}"
   mkdir -p "$CONFIG_DIR"
   : >"$ALLOWED_TCP_PORTS_FILE"
   : >"$ALLOWED_UDP_PORTS_FILE"
   update_blocklist
-
-  if $AUTO; then
-    echo -e "${YELLOW}[AUTO] Skipping initial ports prompt.${NC}"
-  else
-    echo -e "${YELLOW}Add initial allowed TCP ports (comma-separated, e.g. 80,443). Leave empty to skip.${NC}"
-    read -r -p "Ports: " ports
-    if [ -n "$ports" ]; then add_ports "$ALLOWED_TCP_PORTS_FILE" "$ports"; fi
-  fi
 }
 
 # -------------------- RULES --------------------
@@ -129,13 +111,10 @@ apply_rules() {
   if [ -f "$BLOCKED_IPS_FILE" ]; then
     dos2unix_inplace "$BLOCKED_IPS_FILE"
     while IFS= read -r raw; do
-      # skip empties & pure comments fast
       [[ -z "$raw" || "$raw" =~ ^[[:space:]]*# ]] && continue
-      # normalize token
       ip="$(normalize_ip_token "$raw")"
       [[ -z "$ip" ]] && continue
       if is_valid_ipv4_or_cidr "$ip"; then
-        # do not hard-fail if one entry is odd
         iptables -A abuse-defender -s "$ip" -j DROP || true
       fi
     done <"$BLOCKED_IPS_FILE"
@@ -168,7 +147,6 @@ apply_rules() {
   iptables -I FORWARD 1 -j abuse-defender
   iptables -I OUTPUT 1 -j abuse-defender
 
-  # If Docker chain exists, protect it too
   if iptables -L DOCKER-USER -n >/dev/null 2>&1; then
     echo "[+] Docker detected: applying blocklist to DOCKER-USER"
     iptables -I DOCKER-USER 1 -j abuse-defender
@@ -179,7 +157,7 @@ apply_rules() {
   echo -e "${GREEN}Firewall rules applied & saved.${NC}"
 }
 
-# -------------------- PORT HELPERS --------------------
+# -------------------- INTERACTIVE (MENU) --------------------
 add_ports() {
   local file="$1"; local input="$2"
   IFS=',' read -ra items <<<"$input"
@@ -201,7 +179,6 @@ add_ports() {
   done
 }
 
-# -------------------- MENUS (interactive mode only) --------------------
 view_rules(){ clear; iptables -L -n -v --line-numbers; press_enter; }
 manage_ports_interactive(){
   local proto="$1" file
@@ -232,8 +209,10 @@ uninstall_all(){
   [[ "$y" =~ ^[Yy]$ ]] || return
   iptables -F || true; iptables -X || true
   iptables -P INPUT ACCEPT; iptables -P FORWARD ACCEPT; iptables -P OUTPUT ACCEPT
-  rm -rf "$CONFIG_DIR"
-  echo "Uninstalled."; press_enter
+  rm -rf "$CONFIG_DIR" "$SAVED_SCRIPT"
+  rm -f "$LAUNCHER"
+  echo "Uninstalled."
+  press_enter
 }
 
 main_menu(){
@@ -268,15 +247,54 @@ MENU
   done
 }
 
+# -------------------- INSTALL LAUNCHER --------------------
+install_launcher_and_save_copy() {
+  mkdir -p "$CONFIG_DIR"
+  # Save offline copy of the current script from canonical URL
+  if curl -fsSL "$SCRIPT_URL" -o "$SAVED_SCRIPT"; then
+    chmod +x "$SAVED_SCRIPT"
+  fi
+
+  # Create launcher that always opens the menu
+  cat >"$LAUNCHER" <<EOF
+#!/bin/sh
+# Launcher for interactive menu
+exec sudo bash "$SAVED_SCRIPT" --menu
+EOF
+  chmod +x "$LAUNCHER"
+
+  echo -e "${GREEN}Installed launcher: $LAUNCHER${NC}"
+  echo "Tip: run 'sudo firewall-manager' to manage the firewall."
+}
+
 # -------------------- ENTRY --------------------
 if [ "$(id -u)" -ne 0 ]; then echo -e "${RED}Run as root (use sudo).${NC}" >&2; exit 1; fi
 check_dependencies
-initial_setup
 
-if $AUTO; then
-  echo -e "${YELLOW}[AUTO] Non-interactive install: applying rules now...${NC}"
+# If piped and already installed, jump straight to the menu via launcher
+if $PIPED && [ -x "$LAUNCHER" ]; then
+  exec "$LAUNCHER"
+fi
+
+# First-time unattended install when piped:
+if $PIPED && [ ! -d "$CONFIG_DIR" ]; then
+  echo -e "${YELLOW}[AUTO] Non-interactive install: setting up and applying rules...${NC}"
+  initial_setup_noninteractive
   apply_rules
+  install_launcher_and_save_copy
   exit 0
 fi
 
+# If called with --menu (by our launcher), open the interactive menu
+if $FORCE_MENU; then
+  # ensure files exist
+  mkdir -p "$CONFIG_DIR"
+  touch "$ALLOWED_TCP_PORTS_FILE" "$ALLOWED_UDP_PORTS_FILE" "$BLOCKED_IPS_FILE" || true
+  main_menu
+  exit 0
+fi
+
+# Otherwise (run directly in a TTY): show menu
+mkdir -p "$CONFIG_DIR"
+touch "$ALLOWED_TCP_PORTS_FILE" "$ALLOWED_UDP_PORTS_FILE" "$BLOCKED_IPS_FILE" || true
 main_menu
