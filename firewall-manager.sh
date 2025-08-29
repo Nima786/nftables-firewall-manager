@@ -2,16 +2,16 @@
 set -euo pipefail
 
 # =================================================================
-#  Interactive NFTABLES Firewall Manager - v6.3
+#  Interactive NFTABLES Firewall Manager - v6.4
 # =================================================================
 # - First run: apt update && apt upgrade (tracked by state file)
 # - Subsequent runs: quick apt metadata refresh only
 # - Detects & auto-allows current SSH port
 # - Installs deps (nftables, curl)
 # - Overlap-safe blocklist (per-rule drops; no interval sets)
-# - Deterministic rules load (delete table then load from temp)
+# - Deterministic load: delete table IF it exists (no error spam)
 # - TCP/UDP submenus: stay open; changes auto-apply (no prompt)
-# - Forward chain: only ip saddr drops (no duplicate daddr lines)
+# - Forward chain: only ip saddr drops (avoid duplicate-looking lines)
 
 # --- CONFIG ---
 CONFIG_DIR="/etc/firewall_manager_nft"
@@ -25,7 +25,8 @@ STATE_FILE="$CONFIG_DIR/.first_run_done"
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 
 press_enter_to_continue(){ echo ""; read -r -p "Press Enter to return..." < /dev/tty; }
-ensure_config_dir(){ mkdir -p "$CONFIG_DIR"
+ensure_config_dir(){
+  mkdir -p "$CONFIG_DIR"
   [ -f "$ALLOWED_TCP_PORTS_FILE" ] || touch "$ALLOWED_TCP_PORTS_FILE"
   [ -f "$ALLOWED_UDP_PORTS_FILE" ] || touch "$ALLOWED_UDP_PORTS_FILE"
   [ -f "$BLOCKED_IPS_FILE" ]      || touch "$BLOCKED_IPS_FILE"
@@ -144,9 +145,14 @@ apply_rules(){
 
   mapfile -t BLOCKED_CLEAN < <(get_clean_blocklist)
 
+  # Delete existing table if present (don’t error if missing)
+  if nft list table inet firewall-manager >/dev/null 2>&1; then
+    nft delete table inet firewall-manager
+  fi
+
+  # Build a fresh table into a temp file and load it
   local tmp_rules; tmp_rules=$(mktemp)
   {
-    echo "delete table inet firewall-manager"
     echo "table inet firewall-manager {"
     echo "  chain input {"
     echo "    type filter hook input priority 0; policy drop;"
@@ -163,6 +169,7 @@ apply_rules(){
     echo
     echo "  chain forward {"
     echo "    type filter hook forward priority 0; policy drop;"
+    # Only source-side drops here (cleaner output; still blocks spoofed scans)
     for ip in "${BLOCKED_CLEAN[@]:-}"; do
       echo "    ip saddr ${ip} drop"
     done
@@ -172,18 +179,21 @@ apply_rules(){
     echo "    type filter hook output priority 0; policy accept;"
     for ip in "${BLOCKED_CLEAN[@]:-}"; do
       echo "    ip daddr ${ip} drop"
-    done
+    done"
     echo "  }"
     echo "}"
   } > "$tmp_rules"
 
-  nft -f "$tmp_rules" >/dev/null 2>&1 || nft -f "$tmp_rules"
-
-  echo -e "\n${GREEN}Firewall configuration applied successfully!${NC}"
-  echo -e "${YELLOW}Saving rules to /etc/nftables.conf...${NC}"
-  nft list ruleset > /etc/nftables.conf
-  systemctl restart nftables.service >/dev/null 2>&1 || true
-  echo -e "${GREEN}Rules persisted.${NC}"
+  if nft -f "$tmp_rules"; then
+    echo -e "\n${GREEN}Firewall configuration applied successfully!${NC}"
+    echo -e "${YELLOW}Saving rules to /etc/nftables.conf...${NC}"
+    nft list ruleset > /etc/nftables.conf
+    systemctl restart nftables.service >/dev/null 2>&1 || true
+    echo -e "${GREEN}Rules persisted.${NC}"
+  else
+    echo -e "\n${RED}FATAL: Failed to apply nftables ruleset!${NC}"
+    echo "Check for syntax errors or invalid entries in your config files."
+  fi
 
   [[ "$no_pause" == false ]] && press_enter_to_continue
 }
@@ -343,7 +353,7 @@ main_menu(){
   while true; do
     clear
     echo "==============================="
-    echo " NFTABLES FIREWALL MANAGER v6.3"
+    echo " NFTABLES FIREWALL MANAGER v6.4"
     echo "==============================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
