@@ -2,15 +2,16 @@
 set -euo pipefail
 
 # =================================================================
-#  Interactive NFTABLES Firewall Manager - v6.2
+#  Interactive NFTABLES Firewall Manager - v6.3
 # =================================================================
 # - First run: apt update && apt upgrade (tracked by state file)
 # - Subsequent runs: quick apt metadata refresh only
 # - Detects & auto-allows current SSH port
 # - Installs deps (nftables, curl)
 # - Overlap-safe blocklist (per-rule drops; no interval sets)
-# - Deterministic rules build via temp file (no duplicated chains)
-# - Submenus keep you in place after add/remove
+# - Deterministic rules load (delete table then load from temp)
+# - TCP/UDP submenus: stay open; changes auto-apply (no prompt)
+# - Forward chain: only ip saddr drops (no duplicate daddr lines)
 
 # --- CONFIG ---
 CONFIG_DIR="/etc/firewall_manager_nft"
@@ -39,7 +40,7 @@ prepare_system(){
     echo "[+] First run detected: apt update && apt upgrade..."
     apt-get update -y
     apt-get -y upgrade || true
-  else
+  } else {
     apt-get update -y >/dev/null 2>&1 || true
   fi
 
@@ -131,15 +132,12 @@ apply_rules(){
   local ssh_port; ssh_port=$(detect_ssh_port)
   ensure_ssh_in_config
 
-  # Prepare comma lists (safe when empty)
   local tcp_ports udp_ports
   tcp_ports=$({ sort -un "$ALLOWED_TCP_PORTS_FILE" 2>/dev/null | grep -v -x "${ssh_port}" || true; } | tr '\n' ',' | sed 's/,$//')
   udp_ports=$({ sort -un "$ALLOWED_UDP_PORTS_FILE"  2>/dev/null || true; } | tr '\n' ',' | sed 's/,$//')
 
-  # Clean blocklist
   mapfile -t BLOCKED_CLEAN < <(get_clean_blocklist)
 
-  # Build rules into a temp file to avoid accidental duplication
   local tmp_rules; tmp_rules=$(mktemp)
   {
     echo "delete table inet firewall-manager"
@@ -149,7 +147,6 @@ apply_rules(){
     echo "    ct state { established, related } accept"
     echo "    iif lo accept"
     echo "    ct state invalid drop"
-    # inbound blocklist
     for ip in "${BLOCKED_CLEAN[@]:-}"; do
       echo "    ip saddr ${ip} drop"
     done
@@ -160,9 +157,9 @@ apply_rules(){
     echo
     echo "  chain forward {"
     echo "    type filter hook forward priority 0; policy drop;"
+    # only source drops here to avoid “double lines”
     for ip in "${BLOCKED_CLEAN[@]:-}"; do
       echo "    ip saddr ${ip} drop"
-      echo "    ip daddr ${ip} drop"
     done
     echo "  }"
     echo
@@ -175,7 +172,6 @@ apply_rules(){
     echo "}"
   } > "$tmp_rules"
 
-  # Load atomically: delete (ignore errors), then load
   nft -f "$tmp_rules" >/dev/null 2>&1 || nft -f "$tmp_rules"
 
   echo -e "\n${GREEN}Firewall configuration applied successfully!${NC}"
@@ -188,11 +184,7 @@ apply_rules(){
 }
 
 # ---------------- Menus & helpers ----------------
-prompt_to_apply(){
-  echo ""
-  read -r -p "Apply these changes now to make them live? (y/n): " confirm < /dev/tty
-  [[ "$confirm" =~ ^[yY]$ ]] && apply_rules --no-pause || echo -e "${YELLOW}Changes saved to config but NOT applied.${NC}"
-}
+prompt_to_apply(){ apply_rules --no-pause; }  # used after blocklist update
 
 parse_and_process_ports(){
   local action="$1" proto_file="$2" input_ports="$3"
@@ -232,8 +224,7 @@ parse_and_process_ports(){
       echo -e " -> ${RED}Invalid input: $item${NC}"
     fi
   done
-  if ((count>0)); then echo -e "\n${GREEN}Configuration updated.${NC}"; prompt_to_apply
-  else echo -e "\nNo changes were made."; fi
+  echo "$count"
 }
 
 add_ports_interactive(){
@@ -245,7 +236,13 @@ add_ports_interactive(){
       echo "Current ${proto} ports: $(sort -n "$proto_file" 2>/dev/null | paste -s -d, || echo "None")"
       read -r -p "Enter ${proto} port(s) to add (e.g., 80,443 or 1000-2000) or leave empty to go back: " input_ports < /dev/tty
       [[ -z "$input_ports" ]] && break
-      parse_and_process_ports "add" "$proto_file" "$input_ports"
+      local changed; changed=$(parse_and_process_ports "add" "$proto_file" "$input_ports")
+      if (( changed > 0 )); then
+        echo -e "${YELLOW}Applying firewall...${NC}"
+        apply_rules --no-pause
+      else
+        echo "No changes."
+      fi
       press_enter_to_continue
     done
   fi
@@ -259,7 +256,13 @@ remove_ports_interactive(){
     echo "Current ${proto} ports: $(sort -n "$proto_file" 2>/dev/null | paste -s -d, || echo "None")"
     read -r -p "Enter ${proto} port(s) to remove (blank to go back): " input_ports < /dev/tty
     [[ -z "$input_ports" ]] && break
-    parse_and_process_ports "remove" "$proto_file" "$input_ports"
+    local changed; changed=$(parse_and_process_ports "remove" "$proto_file" "$input_ports")
+    if (( changed > 0 )); then
+      echo -e "${YELLOW}Applying firewall...${NC}"
+      apply_rules --no-pause
+    else
+      echo "No changes."
+    fi
     press_enter_to_continue
   done
 }
@@ -335,7 +338,7 @@ main_menu(){
   while true; do
     clear
     echo "==============================="
-    echo " NFTABLES FIREWALL MANAGER v6.2"
+    echo " NFTABLES FIREWALL MANAGER v6.3"
     echo "==============================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
