@@ -24,7 +24,7 @@ NC='\033[0m'
 # --- HELPER FUNCTIONS ---
 function press_enter_to_continue() {
     echo ""
-    read -p "Press Enter to return..."
+    read -r -p "Press Enter to return..."
 }
 
 # --- DEPENDENCY AND SETUP FUNCTIONS ---
@@ -76,7 +76,7 @@ function initial_setup() {
         echo "$SSH_PORT" > "$ALLOWED_TCP_PORTS_FILE"; touch "$ALLOWED_UDP_PORTS_FILE"
         if ! update_blocklist true; then echo -e "${YELLOW}Using a fallback local blocklist...${NC}"; create_default_blocked_ips_fallback; fi
         local input_ports; echo -e "\n${YELLOW}--- Interactive Port Setup ---${NC}"; echo "Port ${SSH_PORT} (SSH) is allowed. Let's add your TCP ports."
-        read -p "Enter initial TCP ports to allow (e.g., 80, 443): " input_ports
+        read -r -p "Enter initial TCP ports to allow (e.g., 80, 443): " input_ports
         parse_and_process_ports "add" "$ALLOWED_TCP_PORTS_FILE" "$input_ports"
         echo -e "\n${GREEN}Initial configuration complete.${NC}"; echo "If you did not apply changes, please select 'Apply Firewall Rules' to activate your setup."; press_enter_to_continue
     fi
@@ -101,7 +101,7 @@ function apply_rules() {
 }
 
 function prompt_to_apply() {
-    echo ""; read -p "Apply these changes now to make them live? (y/n): " confirm
+    echo ""; read -r -p "Apply these changes now to make them live? (y/n): " confirm
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then apply_rules --no-pause;
     else echo -e "${YELLOW}Changes saved to config but NOT applied.${NC}"; fi
 }
@@ -135,20 +135,20 @@ function manage_ports_interactive() {
     local action="$1"; local proto="$2"; local proto_file=""
     if [[ "$proto" == "TCP" ]]; then proto_file="$ALLOWED_TCP_PORTS_FILE"; else proto_file="$ALLOWED_UDP_PORTS_FILE"; fi
     clear; echo -e "${YELLOW}--- ${action^} Allowed ${proto} Ports ---${NC}"; echo "Current allowed ${proto} ports:"; sort -n "$proto_file" | uniq | paste -s -d, || echo "None"; echo ""
-    read -p "Enter ${proto} port(s) to ${action} (e.g., 80, 443, 1000-2000): " input_ports
+    read -r -p "Enter ${proto} port(s) to ${action} (e.g., 80, 443, 1000-2000): " input_ports
     parse_and_process_ports "$action" "$proto_file" "$input_ports"
 }
 
 function view_rules() { clear; echo -e "${YELLOW}--- Current Active IPTABLES Rules ---${NC}"; iptables -L -n -v --line-numbers; press_enter_to_continue; }
 
 function manage_tcp_ports_menu() {
-    while true; do clear; echo "--- Manage Allowed TCP Ports ---"; echo "1) Add TCP Port(s)"; echo "2) Remove TCP Port(s)"; echo "3) Back"; read -p "Choose an option: " choice
+    while true; do clear; echo "--- Manage Allowed TCP Ports ---"; echo "1) Add TCP Port(s)"; echo "2) Remove TCP Port(s)"; echo "3) Back"; read -r -p "Choose an option: " choice
         case $choice in 1) manage_ports_interactive "add" "TCP" ;; 2) manage_ports_interactive "remove" "TCP" ;; 3) break ;; *) echo -e "${RED}Invalid option.${NC}" && sleep 1 ;; esac
     done
 }
 
 function manage_udp_ports_menu() {
-    while true; do clear; echo "--- Manage Allowed UDP Ports ---"; echo "1) Add UDP Port(s)"; echo "2) Remove UDP Port(s)"; echo "3) Back"; read -p "Choose an option: " choice
+    while true; do clear; echo "--- Manage Allowed UDP Ports ---"; echo "1) Add UDP Port(s)"; echo "2) Remove UDP Port(s)"; echo "3) Back"; read -r -p "Choose an option: " choice
         case $choice in 1) manage_ports_interactive "add" "UDP" ;; 2) manage_ports_interactive "remove" "UDP" ;; 3) break ;; *) echo -e "${RED}Invalid option.${NC}" && sleep 1 ;; esac
     done
 }
@@ -156,7 +156,7 @@ function manage_udp_ports_menu() {
 function add_item() {
     local file="$1"; local item_type="$2"; local validation_regex="$3"; local error_message="$4"
     clear; echo -e "${YELLOW}--- Add a new ${item_type} to the configuration ---${NC}"; echo "Current list:"; grep -v '^#' "$file" | grep .; echo ""
-    read -p "Enter the new ${item_type} to add: " item
+    read -r -p "Enter the new ${item_type} to add: " item
     if [[ "$item" =~ $validation_regex ]]; then echo "$item" >> "$file"; echo -e "${GREEN}${item_type^} '$item' added.${NC}"; prompt_to_apply;
     else echo -e "${RED}${error_message}${NC}"; fi
 }
@@ -164,7 +164,7 @@ function add_item() {
 function remove_item() {
     local file="$1"; local item_type="$2"
     clear; echo -e "${YELLOW}--- Remove a ${item_type} from the configuration ---${NC}"; echo "Current list:"; grep -v '^#' "$file" | grep .; echo ""
-    read -p "Enter the ${item_type} to remove: " item
+    read -r -p "Enter the ${item_type} to remove: " item
     if grep -qFx "$item" "$file"; then
         local temp_file=$(mktemp); grep -vFx "$item" "$file" > "$temp_file"; mv "$temp_file" "$file"
         echo -e "${GREEN}${item_type^} '$item' removed.${NC}"; prompt_to_apply
@@ -172,13 +172,13 @@ function remove_item() {
 }
 
 function manage_ips_menu() {
-    while true; do clear; echo "--- Manage Blocked IPs ---"; echo "1) Add IP/CIDR"; echo "2) Remove IP/CIDR"; echo "3) Back"; read -p "Choose an option: " choice
+    while true; do clear; echo "--- Manage Blocked IPs ---"; echo "1) Add IP/CIDR"; echo "2) Remove IP/CIDR"; echo "3) Back"; read -r -p "Choose an option: " choice
         case $choice in 1) add_item "$BLOCKED_IPS_FILE" "IP/CIDR" '^[0-9./]+$' "Invalid format." ;; 2) remove_item "$BLOCKED_IPS_FILE" "IP/CIDR" ;; 3) break ;; *) echo -e "${RED}Invalid option.${NC}" && sleep 1 ;; esac
     done
 }
 
 function flush_rules() {
-    clear; read -p "ARE YOU SURE? This will flush all rules and reset the configuration. (y/n): " confirm
+    clear; read -r -p "ARE YOU SURE? This will flush all rules and reset the configuration. (y/n): " confirm
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         echo "[+] Flushing all rules..."; iptables -F; iptables -X; iptables -P INPUT ACCEPT; iptables -P FORWARD ACCEPT; iptables -P OUTPUT ACCEPT
         echo -e "${YELLOW}Saving empty (open) ruleset..."; netfilter-persistent save
@@ -186,14 +186,14 @@ function flush_rules() {
         rm -f "$ALLOWED_TCP_PORTS_FILE" "$ALLOWED_UDP_PORTS_FILE" "$BLOCKED_IPS_FILE"; echo "$SSH_PORT" > "$ALLOWED_TCP_PORTS_FILE"; touch "$ALLOWED_UDP_PORTS_FILE"
         if ! update_blocklist true; then echo -e "${YELLOW}Using a fallback local blocklist...${NC}"; create_default_blocked_ips_fallback; fi
         echo -e "\n${YELLOW}--- Configuration has been reset ---${NC}";
-        local input_ports; read -p "Enter initial TCP ports to allow (e.g., 80, 443): " input_ports
+        local input_ports; read -r -p "Enter initial TCP ports to allow (e.g., 80, 443): " input_ports
         parse_and_process_ports "add" "$ALLOWED_TCP_PORTS_FILE" "$input_ports"
     else echo "Operation cancelled."; fi
     press_enter_to_continue
 }
 
 function uninstall_script() {
-    clear; echo -e "${RED}--- UNINSTALL FIREWALL & SCRIPT ---${NC}"; read -p "ARE YOU SURE you want to permanently delete the firewall and this script? (y/n): " confirm
+    clear; echo -e "${RED}--- UNINSTALL FIREWALL & SCRIPT ---${NC}"; read -r -p "ARE YOU SURE you want to permanently delete the firewall and this script? (y/n): " confirm
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         echo "[+] Flushing all rules and setting policy to ACCEPT..."; iptables -F; iptables -X; iptables -P INPUT ACCEPT; iptables -P FORWARD ACCEPT; iptables -P OUTPUT ACCEPT
         echo "[+] Saving open firewall state to survive reboot..."; netfilter-persistent save
@@ -209,7 +209,7 @@ function main_menu() {
     while true; do
         clear; echo "==============================="; echo " IPTABLES FIREWALL MANAGER v3.4"; echo "==============================="
         echo "1) View Current Firewall Rules"; echo "2) Apply Firewall Rules from Config"; echo "3) Manage Allowed TCP Ports"; echo "4) Manage Allowed UDP Ports"; echo "5) Manage Blocked IPs"; echo "6) Update IP Blocklist from Source"; echo "7) Flush All Rules & Reset Config"; echo "8) Uninstall Firewall & Script"; echo "9) Exit"
-        echo "-------------------------------"; read -p "Choose an option: " choice
+        echo "-------------------------------"; read -r -p "Choose an option: " choice
         case $choice in 1) view_rules ;; 2) apply_rules ;; 3) manage_tcp_ports_menu ;; 4) manage_udp_ports_menu ;; 5) manage_ips_menu ;; 6) update_blocklist; press_enter_to_continue ;; 7) flush_rules ;; 8) uninstall_script ;; 9) exit 0 ;; *) echo -e "${RED}Invalid option.${NC}" && sleep 1 ;; esac
     done
 }
