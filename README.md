@@ -69,7 +69,7 @@ The Quick Install method does not save the script file. For permanent installati
 
 ```bash
 # Download the script and place it in your system's path
-curl -fsSL https://raw.githubusercontent.com/Nima786/iptables-firewall-manager/main/firewall-manager.sh | sudo bash
+sudo curl -fsSL https://raw.githubusercontent.com/Nima786/iptables-firewall-manager/main/firewall-manager.sh -o /usr/local/bin/firewall-manager
 
 # Make it executable
 sudo chmod +x /usr/local/bin/firewall-manager
