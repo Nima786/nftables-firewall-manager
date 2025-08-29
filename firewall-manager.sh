@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # =================================================================
-#        Interactive NFTABLES Firewall Manager - v5.5 (Definitive)
+#        Interactive NFTABLES Firewall Manager - v5.6 (Definitive)
 # =================================================================
-# A menu-driven utility to manage a modern nftables firewall.
-# v5.5: Removed an unused variable to pass ShellCheck linting.
+# v5.6: Fixed a bug that caused the script to exit silently if a
+#       config file was missing when applying rules.
 
 # --- CONFIGURATION ---
 CONFIG_DIR="/etc/firewall_manager_nft"
@@ -90,6 +90,12 @@ function apply_rules() {
     if [[ "$no_pause" == false ]]; then clear; fi
     echo "[+] Building new nftables ruleset..."
 
+    # --- SAFETY CHECK: Ensure config files exist before reading ---
+    [ ! -f "$ALLOWED_TCP_PORTS_FILE" ] && touch "$ALLOWED_TCP_PORTS_FILE"
+    [ ! -f "$ALLOWED_UDP_PORTS_FILE" ] && touch "$ALLOWED_UDP_PORTS_FILE"
+    [ ! -f "$BLOCKED_IPS_FILE" ] && touch "$BLOCKED_IPS_FILE"
+    # --- END SAFETY CHECK ---
+
     local ssh_port; ssh_port=$(detect_ssh_port)
     local tcp_ports; tcp_ports=$(sort -un "$ALLOWED_TCP_PORTS_FILE" | grep -v "^${ssh_port}$" | tr '\n' ',' | sed 's/,$//')
     local udp_ports; udp_ports=$(sort -un "$ALLOWED_UDP_PORTS_FILE" | tr '\n' ',' | sed 's/,$//')
@@ -145,8 +151,7 @@ function parse_and_process_ports() {
     for item in "${port_items[@]}"; do
         item=$(echo "$item" | xargs)
         if [[ "$item" == *-* ]]; then
-            local start_port; start_port=$(echo "$item" | cut -d'-' -f1)
-            local end_port; end_port=$(echo "$item" | cut -d'-' -f2)
+            local start_port; start_port=$(echo "$item" | cut -d'-' -f1); local end_port; end_port=$(echo "$item" | cut -d'-' -f2)
             if [[ "$start_port" =~ ^[0-9]+$ && "$end_port" =~ ^[0-9]+$ && "$start_port" -le "$end_port" ]]; then
                 for ((port=start_port; port<=end_port; port++)); do
                     if [[ "$action" == "remove" && "$port" == "$ssh_port" && "$proto_file" == "$ALLOWED_TCP_PORTS_FILE" ]]; then continue; fi
@@ -226,7 +231,7 @@ function uninstall_script() {
 
 function main_menu() {
     while true; do
-        clear; echo "==============================="; echo " NFTABLES FIREWALL MANAGER v5.5"; echo "==============================="
+        clear; echo "==============================="; echo " NFTABLES FIREWALL MANAGER v5.6"; echo "==============================="
         echo "1) View Current Firewall Rules"; echo "2) Apply Firewall Rules from Config"; echo "3) Manage Allowed TCP Ports"; echo "4) Manage Allowed UDP Ports"; echo "5) Manage Blocked IPs (WIP)"; echo "6) Update IP Blocklist from Source"; echo "7) Flush All Rules & Reset Config"; echo "8) Uninstall Firewall & Script"; echo "9) Exit"
         echo "-------------------------------"; read -r -p "Choose an option: " choice < /dev/tty
         case $choice in 1) view_rules ;; 2) apply_rules ;; 3) manage_tcp_ports_menu ;; 4) manage_udp_ports_menu ;; 5) manage_ips_menu ;; 6) update_blocklist; press_enter_to_continue ;; 7) flush_rules ;; 8) uninstall_script ;; 9) exit 0 ;; *) echo -e "${RED}Invalid option.${NC}" && sleep 1 ;; esac
