@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # =================================================================
-#        Interactive IPTABLES Firewall Manager - v3.5 (Definitive)
+#        Interactive IPTABLES Firewall Manager - v3.6 (Final)
 # =================================================================
 # A menu-driven utility to manage a robust iptables firewall.
-# v3.5: Fixed all 'read' commands to be pipe-safe by reading
-#       directly from /dev/tty, enabling correct one-liner install.
+# v3.6: Made script ShellCheck compliant by adding '-r' to all
+#       read commands (fixes SC2162).
 
 # --- CONFIGURATION ---
 CONFIG_DIR="/etc/firewall_manager"
@@ -24,7 +24,7 @@ NC='\033[0m'
 # --- HELPER FUNCTIONS ---
 function press_enter_to_continue() {
     echo ""
-    read -p "Press Enter to return..." < /dev/tty # Added < /dev/tty for pipe compatibility
+    read -r -p "Press Enter to return..." < /dev/tty
 }
 
 # --- DEPENDENCY AND SETUP FUNCTIONS ---
@@ -102,7 +102,7 @@ function initial_setup() {
         local input_ports
         echo -e "\n${YELLOW}--- Interactive Port Setup ---${NC}"
         echo "Port ${SSH_PORT} (SSH) is already allowed. Let's add your other TCP service ports."
-        read -p "Enter initial TCP ports to allow (e.g., 80, 443): " input_ports < /dev/tty
+        read -r -p "Enter initial TCP ports to allow (e.g., 80, 443): " input_ports < /dev/tty
         parse_and_process_ports "add" "$ALLOWED_TCP_PORTS_FILE" "$input_ports"
         echo -e "\n${GREEN}Initial configuration complete.${NC}"
         echo "If you did not apply changes, please select 'Apply Firewall Rules' to activate your setup."
@@ -123,7 +123,7 @@ function apply_rules() {
     
     echo "[+] Populating the abuse-defender IP blocklist..."
     while IFS= read -r line || [[ -n "$line" ]]; do
-        line=$(echo "$line" | tr -d '\r' | xargs) # Removes carriage returns and trims whitespace
+        line=$(echo "$line" | tr -d '\r' | xargs)
         [[ "$line" =~ ^#.* ]] || [[ -z "$line" ]] && continue
         iptables -A abuse-defender -d "$line" -j DROP
     done < "$BLOCKED_IPS_FILE"
@@ -170,7 +170,7 @@ function apply_rules() {
 
 function prompt_to_apply() {
     echo ""
-    read -p "Apply these changes now to make them live? (y/n): " confirm < /dev/tty
+    read -r -p "Apply these changes now to make them live? (y/n): " confirm < /dev/tty
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         apply_rules --no-pause
     else
@@ -243,7 +243,7 @@ function manage_ports_interactive() {
     echo "Current allowed ${proto} ports:"
     sort -n "$proto_file" | uniq | paste -s -d, || echo "None"
     echo ""
-    read -p "Enter ${proto} port(s) to ${action} (e.g., 80, 443, 1000-2000): " input_ports < /dev/tty
+    read -r -p "Enter ${proto} port(s) to ${action} (e.g., 80, 443, 1000-2000): " input_ports < /dev/tty
     parse_and_process_ports "$action" "$proto_file" "$input_ports"
     press_enter_to_continue
 }
@@ -262,7 +262,7 @@ function manage_tcp_ports_menu() {
         echo "1) Add TCP Port(s)"
         echo "2) Remove TCP Port(s)"
         echo "3) Back"
-        read -p "Choose an option: " choice < /dev/tty
+        read -r -p "Choose an option: " choice < /dev/tty
         case $choice in
             1) manage_ports_interactive "add" "TCP" ;;
             2) manage_ports_interactive "remove" "TCP" ;;
@@ -279,7 +279,7 @@ function manage_udp_ports_menu() {
         echo "1) Add UDP Port(s)"
         echo "2) Remove UDP Port(s)"
         echo "3) Back"
-        read -p "Choose an option: " choice < /dev/tty
+        read -r -p "Choose an option: " choice < /dev/tty
         case $choice in
             1) manage_ports_interactive "add" "UDP" ;;
             2) manage_ports_interactive "remove" "UDP" ;;
@@ -300,7 +300,7 @@ function add_item() {
     echo "Current list:"
     grep -v '^#' "$file" | grep .
     echo ""
-    read -p "Enter the new ${item_type} to add: " item < /dev/tty
+    read -r -p "Enter the new ${item_type} to add: " item < /dev/tty
     if [[ "$item" =~ $validation_regex ]]; then
         echo "$item" >> "$file"
         echo -e "${GREEN}${item_type^} '$item' added.${NC}"
@@ -320,7 +320,7 @@ function remove_item() {
     echo "Current list:"
     grep -v '^#' "$file" | grep .
     echo ""
-    read -p "Enter the ${item_type} to remove: " item < /dev/tty
+    read -r -p "Enter the ${item_type} to remove: " item < /dev/tty
     if grep -qFx "$item" "$file"; then
         local temp_file
         temp_file=$(mktemp)
@@ -341,7 +341,7 @@ function manage_ips_menu() {
         echo "1) Add IP/CIDR"
         echo "2) Remove IP/CIDR"
         echo "3) Back"
-        read -p "Choose an option: " choice < /dev/tty
+        read -r -p "Choose an option: " choice < /dev/tty
         case $choice in
             1) add_item "$BLOCKED_IPS_FILE" "IP/CIDR" '^[0-9./]+$' "Invalid format." ;;
             2) remove_item "$BLOCKED_IPS_FILE" "IP/CIDR" ;;
@@ -353,7 +353,7 @@ function manage_ips_menu() {
 
 function flush_rules() {
     clear
-    read -p "ARE YOU SURE? This will flush all rules and reset the configuration. (y/n): " confirm < /dev/tty
+    read -r -p "ARE YOU SURE? This will flush all rules and reset the configuration. (y/n): " confirm < /dev/tty
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         echo "[+] Flushing all rules..."
         iptables -F; iptables -X
@@ -372,7 +372,7 @@ function flush_rules() {
         
         echo -e "\n${YELLOW}--- Configuration has been reset ---${NC}"
         local input_ports
-        read -p "Enter initial TCP ports to allow (e.g., 80, 443): " input_ports < /dev/tty
+        read -r -p "Enter initial TCP ports to allow (e.g., 80, 443): " input_ports < /dev/tty
         parse_and_process_ports "add" "$ALLOWED_TCP_PORTS_FILE" "$input_ports"
     else
         echo "Operation cancelled."
@@ -383,7 +383,7 @@ function flush_rules() {
 function uninstall_script() {
     clear
     echo -e "${RED}--- UNINSTALL FIREWALL & SCRIPT ---${NC}"
-    read -p "ARE YOU SURE you want to permanently delete the firewall and this script? (y/n): " confirm < /dev/tty
+    read -r -p "ARE YOU SURE you want to permanently delete the firewall and this script? (y/n): " confirm < /dev/tty
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         echo "[+] Flushing all rules and setting policy to ACCEPT..."
         iptables -F; iptables -X
@@ -405,7 +405,7 @@ function main_menu() {
     while true; do
         clear
         echo "==============================="
-        echo " IPTABLES FIREWALL MANAGER v3.5"
+        echo " IPTABLES FIREWALL MANAGER v3.6"
         echo "==============================="
         echo "1) View Current Firewall Rules"
         echo "2) Apply Firewall Rules from Config"
@@ -417,7 +417,7 @@ function main_menu() {
         echo "8) Uninstall Firewall & Script"
         echo "9) Exit"
         echo "-------------------------------"
-        read -p "Choose an option: " choice < /dev/tty
+        read -r -p "Choose an option: " choice < /dev/tty
         case $choice in
             1) view_rules ;;
             2) apply_rules ;;
