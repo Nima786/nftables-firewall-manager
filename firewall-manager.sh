@@ -219,10 +219,19 @@ function remove_item() {
     local file="$1"; local item_type="$2"
     clear; echo -e "${YELLOW}--- Remove a ${item_type} from the configuration ---${NC}"; echo "Current list:"; grep -v '^#' "$file" | grep .; echo ""
     read -r -p "Enter the ${item_type} to remove: " item < /dev/tty
+
     if grep -qFx "$item" "$file"; then
-        local temp_file=$(mktemp); grep -vFx "$item" "$file" > "$temp_file"; mv "$temp_file" "$file"
-        echo -e "${GREEN}${item_type^} '$item' removed.${NC}"; prompt_to_apply
-    else echo -e "${RED}${item_type^} '$item' not found.${NC}"; fi
+        local temp_file
+        temp_file=$(mktemp)
+        
+        grep -vFx "$item" "$file" > "$temp_file"
+        mv "$temp_file" "$file"
+        
+        echo -e "${GREEN}${item_type^} '$item' removed.${NC}"
+        prompt_to_apply
+    else
+        echo -e "${RED}${item_type^} '$item' not found.${NC}"
+    fi
     press_enter_to_continue
 }
 
