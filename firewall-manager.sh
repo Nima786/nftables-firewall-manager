@@ -22,9 +22,16 @@ done
 # If piped (no TTY), default to AUTO to avoid hangs
 if [ ! -t 0 ]; then AUTO=true; fi
 
-press_enter() { $AUTO && return || { echo; read -r -p "Press Enter to return..."; }; }
+# -------------------- HELPERS --------------------
+press_enter() {
+  if $AUTO; then
+    return
+  else
+    echo
+    read -r -p "Press Enter to return..."
+  fi
+}
 
-# -------------------- DEPENDENCIES --------------------
 need_bin() { command -v "$1" &>/dev/null; }
 install_pkgs() {
   echo -e "${YELLOW}Installing missing packages (requires apt) ...${NC}"
@@ -32,6 +39,7 @@ install_pkgs() {
   DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
 }
 
+# -------------------- DEPENDENCIES --------------------
 check_dependencies() {
   echo -e "${YELLOW}Checking dependencies...${NC}"
   need_bin iptables || install_pkgs iptables
@@ -163,11 +171,11 @@ add_ports() {
 # -------------------- MENUS (interactive mode only) --------------------
 view_rules(){ clear; iptables -L -n -v --line-numbers; press_enter; }
 manage_ports_interactive(){
-  local action="$1" proto="$2" file
+  local proto="$1" file
   file="$ALLOWED_TCP_PORTS_FILE"; [ "$proto" = "UDP" ] && file="$ALLOWED_UDP_PORTS_FILE"
   clear
   echo "Current $proto ports: $(sort -n "$file" 2>/dev/null | paste -s -d,)"
-  read -r -p "Enter ${proto} ports to ${action} (e.g., 80,443 or 1000-2000): " s
+  read -r -p "Enter ${proto} ports to add (e.g., 80,443 or 1000-2000): " s
   [ -n "$s" ] && add_ports "$file" "$s"
   echo "Saved."
   press_enter
@@ -216,8 +224,8 @@ MENU
     case "$c" in
       1) view_rules ;;
       2) apply_rules ;;
-      3) manage_ports_interactive add TCP ;;
-      4) manage_ports_interactive add UDP ;;
+      3) manage_ports_interactive TCP ;;
+      4) manage_ports_interactive UDP ;;
       5) update_blocklist_menu ;;
       6) reset_config ;;
       7) uninstall_all ;;
