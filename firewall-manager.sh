@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # =================================================================
-#  Interactive NFTABLES Firewall Manager - v6.4
+#  Interactive NFTABLES Firewall Manager - v6.5
 # =================================================================
 # - First run: apt update && apt upgrade (tracked by state file)
 # - Subsequent runs: quick apt metadata refresh only
 # - Detects & auto-allows current SSH port
 # - Installs deps (nftables, curl)
 # - Overlap-safe blocklist (per-rule drops; no interval sets)
-# - Deterministic load: delete table IF it exists (no error spam)
+# - Deterministic load: delete table if it exists, then create fresh
 # - TCP/UDP submenus: stay open; changes auto-apply (no prompt)
 # - Forward chain: only ip saddr drops (avoid duplicate-looking lines)
 
@@ -25,6 +25,7 @@ STATE_FILE="$CONFIG_DIR/.first_run_done"
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 
 press_enter_to_continue(){ echo ""; read -r -p "Press Enter to return..." < /dev/tty; }
+
 ensure_config_dir(){
   mkdir -p "$CONFIG_DIR"
   [ -f "$ALLOWED_TCP_PORTS_FILE" ] || touch "$ALLOWED_TCP_PORTS_FILE"
@@ -74,7 +75,11 @@ detect_ssh_port(){
   [[ "$port" =~ ^[0-9]+$ ]] && ((port>=1 && port<=65535)) || port=22
   echo "$port"
 }
-ensure_ssh_in_config(){ local ssh_port; ssh_port=$(detect_ssh_port); grep -qx "$ssh_port" "$ALLOWED_TCP_PORTS_FILE" || echo "$ssh_port" >> "$ALLOWED_TCP_PORTS_FILE"; }
+
+ensure_ssh_in_config(){
+  local ssh_port; ssh_port=$(detect_ssh_port)
+  grep -qx "$ssh_port" "$ALLOWED_TCP_PORTS_FILE" || echo "$ssh_port" >> "$ALLOWED_TCP_PORTS_FILE"
+}
 
 # ---------------- Blocklist handling ----------------
 update_blocklist(){
@@ -93,6 +98,7 @@ update_blocklist(){
   rm -f "$tmp" || true
   return 1
 }
+
 create_default_blocked_ips_fallback(){
   cat > "$BLOCKED_IPS_FILE" << 'EOL'
 # FALLBACK LIST
@@ -101,11 +107,14 @@ create_default_blocked_ips_fallback(){
 192.168.0.0/16
 EOL
 }
-get_clean_blocklist(){ awk '
-  /^[[:space:]]*#/ { next }
-  /^[[:space:]]*$/ { next }
-  { gsub(/\r/,""); gsub(/^[[:space:]]+|[[:space:]]+$/,""); if (length($0)>0) print $0 }
-' "$BLOCKED_IPS_FILE" | sort -u; }
+
+get_clean_blocklist(){
+  awk '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*$/ { next }
+    { gsub(/\r/,""); gsub(/^[[:space:]]+|[[:space:]]+$/,""); if (length($0)>0) print $0 }
+  ' "$BLOCKED_IPS_FILE" | sort -u
+}
 
 # ---------------- First-time setup ----------------
 initial_setup(){
@@ -145,7 +154,7 @@ apply_rules(){
 
   mapfile -t BLOCKED_CLEAN < <(get_clean_blocklist)
 
-  # Delete existing table if present (don’t error if missing)
+  # Delete existing table if present (avoid error on first run)
   if nft list table inet firewall-manager >/dev/null 2>&1; then
     nft delete table inet firewall-manager
   fi
@@ -179,7 +188,7 @@ apply_rules(){
     echo "    type filter hook output priority 0; policy accept;"
     for ip in "${BLOCKED_CLEAN[@]:-}"; do
       echo "    ip daddr ${ip} drop"
-    done"
+    done
     echo "  }"
     echo "}"
   } > "$tmp_rules"
@@ -353,7 +362,7 @@ main_menu(){
   while true; do
     clear
     echo "==============================="
-    echo " NFTABLES FIREWALL MANAGER v6.4"
+    echo " NFTABLES FIREWALL MANAGER v6.5"
     echo "==============================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
