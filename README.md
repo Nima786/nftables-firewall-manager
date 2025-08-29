@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://i.imgur.com/v8F0q7Z.png" alt="Firewall Manager Logo" width="150"/>
+  <img src="https://github.com/Nima786/iptables-firewall-manager/blob/main/assets/firewall-manager-logo.webp" alt="Firewall Manager Logo" width="150"/>
 </p>
 <h1 align="center">IPTABLES Firewall Manager</h1>
 <p align="center">
