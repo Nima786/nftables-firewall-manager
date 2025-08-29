@@ -39,6 +39,30 @@ install_pkgs() {
   DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
 }
 
+# Remove Windows CRs in-place (safe if not present)
+dos2unix_inplace() { sed -i 's/\r$//' "$1"; }
+
+# Return normalized first token of a line (no comment/commas/space/CR); echo empty if nothing
+normalize_ip_token() {
+  # input in $1
+  local t="$1"
+  # strip trailing CRs
+  t="${t//$'\r'/}"
+  # drop comments starting with '#'
+  t="${t%%#*}"
+  # cut at whitespace, comma, semicolon
+  t="${t%% *}"; t="${t%%,*}"; t="${t%%;*}"
+  # trim surrounding spaces
+  t="$(echo "$t" | xargs)"
+  printf '%s' "$t"
+}
+
+is_valid_ipv4_or_cidr() {
+  # 1.2.3.4 or 1.2.3.4/0-32
+  local r='^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]|[12][0-9]|3[0-2]))?$'
+  [[ "$1" =~ $r ]]
+}
+
 # -------------------- DEPENDENCIES --------------------
 check_dependencies() {
   echo -e "${YELLOW}Checking dependencies...${NC}"
@@ -65,7 +89,7 @@ update_blocklist() {
   echo -e "${YELLOW}Fetching blocklist...${NC}"
   local tmp; tmp=$(mktemp)
   if curl -fsSL "$BLOCKLIST_URL" -o "$tmp" && [ -s "$tmp" ] && [ "$(wc -l <"$tmp")" -gt 10 ]; then
-    sed -i 's/\r$//' "$tmp"
+    dos2unix_inplace "$tmp"
     mv "$tmp" "$BLOCKED_IPS_FILE"
     echo -e "${GREEN}Blocklist updated (${BLOCKED_IPS_FILE}).${NC}"
   else
@@ -96,15 +120,24 @@ initial_setup() {
 # -------------------- RULES --------------------
 apply_rules() {
   echo "[+] Flushing existing rules..."
-  iptables -F; iptables -X || true
+  iptables -F || true; iptables -X || true
 
-  # chain for blocklist
+  echo "[+] Creating blocklist chain..."
   iptables -N abuse-defender 2>/dev/null || true
+
   echo "[+] Loading blocklist..."
   if [ -f "$BLOCKED_IPS_FILE" ]; then
-    while IFS= read -r ip; do
-      [[ -z "$ip" || "$ip" =~ ^# ]] && continue
-      iptables -A abuse-defender -s "$ip" -j DROP
+    dos2unix_inplace "$BLOCKED_IPS_FILE"
+    while IFS= read -r raw; do
+      # skip empties & pure comments fast
+      [[ -z "$raw" || "$raw" =~ ^[[:space:]]*# ]] && continue
+      # normalize token
+      ip="$(normalize_ip_token "$raw")"
+      [[ -z "$ip" ]] && continue
+      if is_valid_ipv4_or_cidr "$ip"; then
+        # do not hard-fail if one entry is odd
+        iptables -A abuse-defender -s "$ip" -j DROP || true
+      fi
     done <"$BLOCKED_IPS_FILE"
   fi
 
@@ -186,7 +219,7 @@ reset_config(){
   clear
   read -r -p "This will flush rules and reset config. Continue? (y/n): " y
   [[ "$y" =~ ^[Yy]$ ]] || return
-  iptables -F; iptables -X || true
+  iptables -F || true; iptables -X || true
   rm -rf "$CONFIG_DIR"; mkdir -p "$CONFIG_DIR"
   : >"$ALLOWED_TCP_PORTS_FILE"; : >"$ALLOWED_UDP_PORTS_FILE"; : >"$BLOCKED_IPS_FILE"
   update_blocklist
@@ -197,7 +230,7 @@ uninstall_all(){
   clear
   read -r -p "Uninstall firewall & remove config? (y/n): " y
   [[ "$y" =~ ^[Yy]$ ]] || return
-  iptables -F; iptables -X || true
+  iptables -F || true; iptables -X || true
   iptables -P INPUT ACCEPT; iptables -P FORWARD ACCEPT; iptables -P OUTPUT ACCEPT
   rm -rf "$CONFIG_DIR"
   echo "Uninstalled."; press_enter
