@@ -2,14 +2,15 @@
 set -euo pipefail
 
 # =================================================================
-#        Interactive NFTABLES Firewall Manager - v7.8
+#        Interactive NFTABLES Firewall Manager - v7.9
 # =================================================================
 # - First-run system prep only once (state file)
 # - Detect SSH port automatically and protect it
 # - Manage allowed TCP/UDP ports and IPv4 blocklist
 # - Docker-friendly (keeps published ports working)
 # - Blocks egress to blocked ranges BEFORE Docker bridge accepts
-# - FIX: removed duplicate ip saddr block in FORWARD chain
+# - FIX: robust blocklist sanitizing (no empty 'ip saddr/daddr  drop')
+# - FIX: single ip saddr block in FORWARD (duplicate removed)
 
 # --- CONFIGURATION ---
 CONFIG_DIR="/etc/firewall_manager_nft"
@@ -41,7 +42,7 @@ prepare_system() {
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y >/dev/null
     apt-get -y upgrade >/dev/null || true
-    apt-get install -y nftables curl >/dev/null
+    apt-get install -y nftables curl iproute2 >/dev/null
     systemctl enable nftables >/dev/null 2>&1 || true
     systemctl start nftables >/dev/null 2>&1 || true
     echo "done" > "$STATE_FILE"
@@ -52,7 +53,6 @@ prepare_system() {
 }
 
 detect_ssh_port() {
-  # Prefer live socket; fall back to sshd_config; default 22
   local p
   p="$(ss -ltnp 2>/dev/null | awk '/sshd/ && /LISTEN/ {sub(/^.*:/,"",$4); print $4}' | head -n1 || true)"
   if [[ -z "$p" ]]; then
@@ -94,22 +94,23 @@ update_blocklist() {
   return 0
 }
 
+# --- Strong sanitizer: only valid IPv4 or IPv4/CIDR lines survive ---
 canonicalize_blocklist_to_array() {
-  # -> BLOCKED_CLEAN[] unique, no comments/blank/CR
   local line
   local tmp_arr=()
   [ -f "$BLOCKED_IPS_FILE" ] || touch "$BLOCKED_IPS_FILE"
   while IFS= read -r line || [ -n "$line" ]; do
-    line="${line%%#*}"                # strip trailing comment
-    line="$(echo "$line" | tr -d '\r' | xargs || true)"
+    line="${line%%#*}"                          # strip trailing inline comment
+    line="$(echo "$line" | tr -d '\r' | xargs)" # trim + drop CR
     [[ -z "$line" ]] && continue
-    tmp_arr+=("$line")
+    if [[ "$line" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
+      tmp_arr+=("$line")
+    fi
   done < "$BLOCKED_IPS_FILE"
   mapfile -t BLOCKED_CLEAN < <(printf "%s\n" "${tmp_arr[@]}" | sort -u)
 }
 
 discover_docker_bridges() {
-  # Outputs list of docker bridge names (docker0 and br-xxxxxxxxxxxx)
   ip -o link show 2>/dev/null | awk -F': ' '{print $2}' \
     | grep -E '^(docker0|br-[0-9a-f]{12})$' || true
 }
@@ -121,63 +122,57 @@ apply_rules() {
 
   echo "[+] Building new nftables ruleset..."
 
-  # Safety: ensure config files exist
   mkdir -p "$CONFIG_DIR"
   touch "$ALLOWED_TCP_PORTS_FILE" "$ALLOWED_UDP_PORTS_FILE" "$BLOCKED_IPS_FILE"
 
   local ssh_port; ssh_port="$(detect_ssh_port)"
 
-  # Read allowed ports (unique, numeric)
   local tcp_ports udp_ports
-  tcp_ports="$(grep -E '^[0-9]+$' "$ALLOWED_TCP_PORTS_FILE" | sort -un | grep -v "^${ssh_port}$" | paste -sd, - || true)"
-  udp_ports="$(grep -E '^[0-9]+$' "$ALLOWED_UDP_PORTS_FILE" | sort -un | paste -sd, - || true)"
+  tcp_ports="$(grep -E '^[0-9]+$' "$ALLOWED_TCP_PORTS_FILE" 2>/dev/null | sort -un | grep -v "^${ssh_port}$" | paste -sd, - || true)"
+  udp_ports="$(grep -E '^[0-9]+$' "$ALLOWED_UDP_PORTS_FILE" 2>/dev/null | sort -un | paste -sd, - || true)"
 
-  # Load/clean blocklist
   canonicalize_blocklist_to_array
 
-  # Build ruleset
   {
     printf "flush ruleset\n"
     printf "table inet firewall-manager {\n"
 
-    # INPUT
+    # INPUT chain
     printf "  chain input {\n"
     printf "    type filter hook input priority filter; policy drop;\n"
     printf "    ct state { established, related } accept\n"
     printf "    iif \"lo\" accept\n"
     printf "    ct state invalid drop\n"
-    # Block suspicious sources inbound
     if ((${#BLOCKED_CLEAN[@]})); then
       for ip in "${BLOCKED_CLEAN[@]}"; do printf "    ip saddr %s drop\n" "$ip"; done
     fi
-    # SSH and allowed ports
     printf "    tcp dport %s accept\n" "$ssh_port"
-    if [[ -n "$tcp_ports" ]]; then printf "    tcp dport { %s } accept\n" "$tcp_ports"; fi
-    if [[ -n "$udp_ports" ]]; then printf "    udp dport { %s } accept\n" "$udp_ports"; fi
+    [[ -n "$tcp_ports" ]] && printf "    tcp dport { %s } accept\n" "$tcp_ports"
+    [[ -n "$udp_ports" ]] && printf "    udp dport { %s } accept\n" "$udp_ports"
     printf "  }\n\n"
 
-    # FORWARD
+    # FORWARD chain
     printf "  chain forward {\n"
     printf "    type filter hook forward priority filter; policy drop;\n"
     printf "    ct state { established, related } accept\n"
     printf "    ct state invalid drop\n"
-    # Block egress to blocked destinations BEFORE Docker accepts
+    # Block egress to blocked destinations BEFORE docker accepts
     if ((${#BLOCKED_CLEAN[@]})); then
       for ip in "${BLOCKED_CLEAN[@]}"; do printf "    ip daddr %s drop\n" "$ip"; done
     fi
-    # Allow docker bridges (both directions)
+    # Docker bridges (both directions)
     while read -r br; do
       [[ -z "$br" ]] && continue
       printf "    iifname \"%s\" accept\n" "$br"
       printf "    oifname \"%s\" accept\n" "$br"
     done < <(discover_docker_bridges)
-    # (Keep ONE source-block list after docker accepts)
+    # One source-block list after docker accepts
     if ((${#BLOCKED_CLEAN[@]})); then
       for ip in "${BLOCKED_CLEAN[@]}"; do printf "    ip saddr %s drop\n" "$ip"; done
     fi
     printf "  }\n\n"
 
-    # OUTPUT
+    # OUTPUT chain
     printf "  chain output {\n"
     printf "    type filter hook output priority filter; policy accept;\n"
     if ((${#BLOCKED_CLEAN[@]})); then
@@ -187,7 +182,6 @@ apply_rules() {
 
     printf "}\n"
   } > /tmp/.nft.rules.$$
-
 
   if nft -f /tmp/.nft.rules.$$; then
     echo -e "\n${GREEN}Firewall configuration applied successfully!${NC}"
@@ -224,10 +218,10 @@ parse_and_process_ports() {
       if [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ && "$a" -le "$b" ]]; then
         for ((p=a; p<=b; p++)); do
           if [[ "$action" == "remove" && "$proto_file" == "$ALLOWED_TCP_PORTS_FILE" && "$p" == "$ssh_port" ]]; then continue; fi
-          if [[ "$action" == "add" && ! $(grep -qx "$p" "$proto_file" 2>/dev/null; echo $?) -eq 0 ]]; then
-            echo "$p" >> "$proto_file"; ((count++))
-          elif [[ "$action" == "remove" && $(grep -qx "$p" "$proto_file"; echo $?) -eq 0 ]]; then
-            sed -i "/^${p}\$/d" "$proto_file"; ((count++))
+          if ! grep -qx "$p" "$proto_file" 2>/dev/null; then
+            [[ "$action" == "add" ]] && { echo "$p" >> "$proto_file"; ((count++)); }
+          else
+            [[ "$action" == "remove" ]] && { sed -i "/^${p}\$/d" "$proto_file"; ((count++)); }
           fi
         done
         echo -e " -> ${GREEN}Port range $item processed.${NC}"
@@ -239,12 +233,12 @@ parse_and_process_ports() {
         echo -e " -> ${RED}Safety: Cannot remove SSH port (${ssh_port}).${NC}"
         continue
       fi
-      if [[ "$action" == "add" && ! $(grep -qx "$item" "$proto_file" 2>/dev/null; echo $?) -eq 0 ]]; then
-        echo "$item" >> "$proto_file"; ((count++)); echo -e " -> ${GREEN}Port $item added.${NC}"
-      elif [[ "$action" == "remove" && $(grep -qx "$item" "$proto_file"; echo $?) -eq 0 ]]; then
-        sed -i "/^${item}\$/d" "$proto_file"; ((count++)); echo -e " -> ${GREEN}Port $item removed.${NC}"
+      if ! grep -qx "$item" "$proto_file" 2>/dev/null; then
+        [[ "$action" == "add" ]] && { echo "$item" >> "$proto_file"; ((count++)); echo -e " -> ${GREEN}Port $item added.${NC}"; }
       else
-        echo -e " -> ${YELLOW}No change for $item.${NC}"
+        [[ "$action" == "remove" ]] \
+          && { sed -i "/^${item}\$/d" "$proto_file"; ((count++)); echo -e " -> ${GREEN}Port $item removed.${NC}"; } \
+          || echo -e " -> ${YELLOW}Port $item already exists.${NC}"
       fi
     elif [[ -n "$item" ]]; then
       echo -e " -> ${RED}Invalid input: $item${NC}"
@@ -256,36 +250,44 @@ parse_and_process_ports() {
 }
 
 manage_ports_interactive() {
-  local action="$1" proto="$2" file
+  local proto="$2" file action
   file="$ALLOWED_TCP_PORTS_FILE"; [[ "$proto" == "UDP" ]] && file="$ALLOWED_UDP_PORTS_FILE"
   while true; do
     clear
-    echo -e "${YELLOW}--- ${action^} Allowed ${proto} Ports ---${NC}"
+    echo -e "${YELLOW}--- Manage Allowed ${proto} Ports ---${NC}"
     echo -n "Current ${proto} ports: "
     (grep -E '^[0-9]+$' "$file" 2>/dev/null | sort -un | paste -sd, -) || echo "None"
     echo ""
-    read -r -p "Enter ${proto} port(s) to ${action} (e.g., 80,443 or 1000-2000) or leave empty to go back: " input_ports < /dev/tty
-    [[ -z "$input_ports" ]] && break
+    echo "1) Add"
+    echo "2) Remove"
+    echo "3) Back"
+    read -r -p "Choose: " opt < /dev/tty
+    case "$opt" in
+      1) action="add" ;;
+      2) action="remove" ;;
+      3) break ;;
+      *) echo -e "${RED}Invalid option.${NC}"; sleep 1; continue ;;
+    esac
+    read -r -p "Enter ${proto} port(s) to ${action} (e.g., 80,443 or 1000-2000): " input_ports < /dev/tty
+    [[ -z "$input_ports" ]] && continue
     parse_and_process_ports "$action" "$file" "$input_ports"
   done
 }
 
-# --- Blocklist manage ---
 add_block_item() {
-  local label="$1"
   while true; do
     clear
-    echo -e "${YELLOW}--- Add ${label} ---${NC}"
+    echo -e "${YELLOW}--- Add IP/CIDR ---${NC}"
     echo "Current list:"
     grep -v '^\s*#' "$BLOCKED_IPS_FILE" | sed '/^\s*$/d' | nl -ba || true
     echo ""
-    read -r -p "Enter ${label} (IPv4 or CIDR) or empty to go back: " item < /dev/tty
+    read -r -p "Enter IPv4 or IPv4/CIDR (empty to back): " item < /dev/tty
     [[ -z "$item" ]] && return
     item="$(echo "$item" | xargs)"
-    if [[ "$item" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$ ]]; then
+    if [[ "$item" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
       echo "$item" >> "$BLOCKED_IPS_FILE"
       sort -u "$BLOCKED_IPS_FILE" -o "$BLOCKED_IPS_FILE"
-      echo -e "${GREEN}${label} '$item' added.${NC}"
+      echo -e "${GREEN}Added: $item${NC}"
       prompt_to_apply
     else
       echo -e "${RED}Invalid IPv4/CIDR.${NC}"; press_enter_to_continue
@@ -294,18 +296,17 @@ add_block_item() {
 }
 
 remove_block_item() {
-  local label="$1"
   while true; do
     clear
-    echo -e "${YELLOW}--- Remove ${label} ---${NC}"
+    echo -e "${YELLOW}--- Remove IP/CIDR ---${NC}"
     echo "Current list:"
     grep -v '^\s*#' "$BLOCKED_IPS_FILE" | sed '/^\s*$/d' | nl -ba || true
     echo ""
-    read -r -p "Enter exact ${label} (IPv4 or CIDR) to remove or empty to go back: " item < /dev/tty
+    read -r -p "Enter exact IPv4/CIDR to remove (empty to back): " item < /dev/tty
     [[ -z "$item" ]] && return
     if grep -qx "$item" "$BLOCKED_IPS_FILE"; then
       sed -i "/^${item//\//\\/}\$/d" "$BLOCKED_IPS_FILE"
-      echo -e "${GREEN}${label} '$item' removed.${NC}"
+      echo -e "${GREEN}Removed: $item${NC}"
       prompt_to_apply
     else
       echo -e "${RED}Not found: ${item}${NC}"; press_enter_to_continue
@@ -322,8 +323,8 @@ manage_ips_menu() {
     echo "3) Back"
     read -r -p "Choose an option: " c < /dev/tty
     case "$c" in
-      1) add_block_item "IP/CIDR" ;;
-      2) remove_block_item "IP/CIDR" ;;
+      1) add_block_item ;;
+      2) remove_block_item ;;
       3) break ;;
       *) echo -e "${RED}Invalid option.${NC}" && sleep 1 ;;
     esac
@@ -390,7 +391,7 @@ initial_setup() {
 main_menu() {
   while true; do
     clear
-    echo "NFTABLES FIREWALL MANAGER v7.8"
+    echo "NFTABLES FIREWALL MANAGER v7.9"
     echo "================================"
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
@@ -406,8 +407,8 @@ main_menu() {
     case "$choice" in
       1) view_rules ;;
       2) apply_rules ;;
-      3) manage_ports_interactive "add/remove" "TCP" ;;   # shows a loop add/remove by prompt
-      4) manage_ports_interactive "add/remove" "UDP" ;;
+      3) manage_ports_interactive "PORTS" "TCP" ;;
+      4) manage_ports_interactive "PORTS" "UDP" ;;
       5) manage_ips_menu ;;
       6) update_blocklist; press_enter_to_continue ;;
       7) flush_rules ;;
