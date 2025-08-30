@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =================================================================
-#  Interactive NFTABLES Firewall Manager - v6.8
+#  Interactive NFTABLES Firewall Manager - v6.9
 # =================================================================
 # - First run ONLY: apt update/upgrade + install deps (nftables, curl)
 # - Subsequent runs: NO apt checks and NO package installs
@@ -18,7 +18,7 @@ set -euo pipefail
 #   2) Apply now
 #   3) Manage TCP
 #   4) Manage UDP
-#   5) Manage Blocked IPs  ← NEW
+#   5) Manage Blocked IPs
 #   6) Update blocklist from source
 #   7) Flush rules & reset config
 #   8) Uninstall firewall & script
@@ -30,7 +30,7 @@ ALLOWED_TCP_PORTS_FILE="$CONFIG_DIR/allowed_tcp_ports.conf"
 ALLOWED_UDP_PORTS_FILE="$CONFIG_DIR/allowed_udp_ports.conf"
 BLOCKED_IPS_FILE="$CONFIG_DIR/blocked_ips.conf"
 BLOCKLIST_URL="https://raw.githubusercontent.com/Kiya6955/Abuse-Defender/main/abuse-ips.ipv4"
-FIRST_RUN_STATE="$CONFIG_DIR/.system_prep_done"   # set only by prepare_system()
+FIRST_RUN_STATE="$CONFIG_DIR/.system_prep_done"
 
 # --- COLORS ---
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
@@ -143,7 +143,9 @@ apply_rules(){
   tcp_ports=$({ sort -un "$ALLOWED_TCP_PORTS_FILE" 2>/dev/null | grep -v -x "${ssh_port}" || true; } | tr '\n' ',' | sed 's/,$//')
   udp_ports=$({ sort -un "$ALLOWED_UDP_PORTS_FILE"  2>/dev/null || true; } | tr '\n' ',' | sed 's/,$//')
 
-  mapfile -t BLOCKED_CLEAN < <(get_clean_blocklist)
+  # Build list of clean block entries (may be empty)
+  declare -a BLOCKED_CLEAN=()
+  mapfile -t BLOCKED_CLEAN < <(get_clean_blocklist) || true
 
   # Delete existing table if present (avoid error on first run)
   if nft list table inet firewall-manager >/dev/null 2>&1; then
@@ -159,9 +161,11 @@ apply_rules(){
     echo "    ct state { established, related } accept"
     echo "    iif lo accept"
     echo "    ct state invalid drop"
-    for ip in "${BLOCKED_CLEAN[@]:-}"; do
-      echo "    ip saddr ${ip} drop"
-    done
+    if ((${#BLOCKED_CLEAN[@]})); then
+      for ip in "${BLOCKED_CLEAN[@]}"; do
+        echo "    ip saddr ${ip} drop"
+      done
+    fi
     echo "    tcp dport ${ssh_port} accept"
     [[ -n "$tcp_ports" ]] && echo "    tcp dport { ${tcp_ports} } accept"
     [[ -n "$udp_ports" ]] && echo "    udp dport { ${udp_ports} } accept"
@@ -169,17 +173,20 @@ apply_rules(){
     echo
     echo "  chain forward {"
     echo "    type filter hook forward priority 0; policy drop;"
-    # Source-side drops (cleaner; still blocks spoofed scans)
-    for ip in "${BLOCKED_CLEAN[@]:-}"; do
-      echo "    ip saddr ${ip} drop"
-    done
+    if ((${#BLOCKED_CLEAN[@]})); then
+      for ip in "${BLOCKED_CLEAN[@]}"; do
+        echo "    ip saddr ${ip} drop"
+      done
+    fi
     echo "  }"
     echo
     echo "  chain output {"
     echo "    type filter hook output priority 0; policy accept;"
-    for ip in "${BLOCKED_CLEAN[@]:-}"; do
-      echo "    ip daddr ${ip} drop"
-    done
+    if ((${#BLOCKED_CLEAN[@]})); then
+      for ip in "${BLOCKED_CLEAN[@]}"; do
+        echo "    ip daddr ${ip} drop"
+      done
+    fi
     echo "  }"
     echo "}"
   } > "$tmp_rules"
@@ -199,7 +206,7 @@ apply_rules(){
 }
 
 # ---------------- Menus & helpers ----------------
-prompt_to_apply(){ apply_rules --no-pause; }  # used after blocklist update
+prompt_to_apply(){ apply_rules --no-pause; }
 
 parse_and_process_ports(){
   local action="$1" proto_file="$2" input_ports="$3"
@@ -257,11 +264,10 @@ parse_and_process_ports(){
     fi
   done
 
-  # only the numeric count goes to stdout
   printf '%s\n' "$count"
 }
 
-# ---- IPv4 / CIDR validation (simple, no external deps) ----
+# ---- IPv4 / CIDR validation ----
 valid_ipv4_cidr(){
   local s="$1" ip mask
   ip=${s%%/*}; mask=${s#*/}
@@ -292,7 +298,6 @@ parse_and_process_ips(){
       fi
     else
       if grep -qxF "$item" "$BLOCKED_IPS_FILE"; then
-        # escape / in sed delimiter
         local esc="${item//\//\\/}"
         sed -i "\#^${esc}$#d" "$BLOCKED_IPS_FILE"; ((count++))
         echo -e " -> ${GREEN}$item removed from blocklist.${NC}" >&2
@@ -342,12 +347,18 @@ manage_ips_menu(){
     case $choice in
       1)
         read -r -p "Enter IPs/CIDRs to ADD: " ips < /dev/tty
-        [[ -z "$ips" ]] || { changed=$(parse_and_process_ips "add" "$ips"); (( changed > 0 )) && { echo -e "${YELLOW}Applying firewall...${NC}"; apply_rules --no-pause; }; }
+        if [[ -n "$ips" ]]; then
+          local changed; changed=$(parse_and_process_ips "add" "$ips")
+          (( changed > 0 )) && { echo -e "${YELLOW}Applying firewall...${NC}"; apply_rules --no-pause; }
+        fi
         press_enter_to_continue
         ;;
       2)
         read -r -p "Enter IPs/CIDRs to REMOVE: " ips < /dev/tty
-        [[ -z "$ips" ]] || { changed=$(parse_and_process_ips "remove" "$ips"); (( changed > 0 )) && { echo -e "${YELLOW}Applying firewall...${NC}"; apply_rules --no-pause; }; }
+        if [[ -n "$ips" ]]; then
+          local changed; changed=$(parse_and_process_ips "remove" "$ips")
+          (( changed > 0 )) && { echo -e "${YELLOW}Applying firewall...${NC}"; apply_rules --no-pause; }
+        fi
         press_enter_to_continue
         ;;
       3) break ;;
@@ -425,7 +436,7 @@ main_menu(){
   while true; do
     clear
     echo "==============================="
-    echo " NFTABLES FIREWALL MANAGER v6.8"
+    echo " NFTABLES FIREWALL MANAGER v6.9"
     echo "==============================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
@@ -458,6 +469,6 @@ if [ "$(id -u)" -ne 0 ]; then
   echo -e "${RED}This script must be run as root. Please use sudo.${NC}" >&2
   exit 1
 fi
-prepare_system           # runs ONLY once; skipped afterwards
-initial_setup            # creates config dir if missing
+prepare_system
+initial_setup
 main_menu
