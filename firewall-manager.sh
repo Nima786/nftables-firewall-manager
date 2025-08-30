@@ -2,16 +2,15 @@
 set -euo pipefail
 
 # =================================================================
-#  Interactive NFTABLES Firewall Manager - v7.1
+#  Interactive NFTABLES Firewall Manager - v7.2
 # =================================================================
 # - First run ONLY: apt update/upgrade + install deps (nftables, curl)
-# - Subsequent runs: NO apt checks / installs
 # - Detect & auto-allow current SSH port
 # - Manage TCP/UDP ports (auto-apply; stays in submenu)
-# - Manage Blocked IPs (IPv4/CIDR add/remove; auto-apply)
-# - Auto-populate blocklist when empty (download or fallback)
+# - Manage Blocked IPs (IPv4/CIDR add/remove; auto-apply; stays in submenu)
+# - Auto-populate & canonicalize blocklist
 # - Clean table reload: delete-if-exists, then create fresh
-# - Forward chain: only ip saddr drops (cleaner)
+# - Forward: only ip saddr drops (cleaner)
 #
 # Menu:
 #   1) View rules
@@ -81,12 +80,21 @@ ensure_ssh_in_config(){
 }
 
 # ---------------- Blocklist handling ----------------
-get_clean_blocklist(){
+canonicalize_blocklist_file(){
+  # Normalize the stored list (trim, de-CR, drop blanks/comments, dedupe)
+  local tmp; tmp=$(mktemp)
   awk '
+    { gsub(/\r/,"") }
     /^[[:space:]]*#/ { next }
-    /^[[:space:]]*$/ { next }
-    { gsub(/\r/,""); gsub(/^[[:space:]]+|[[:space:]]+$/,""); if (length($0)>0) print $0 }
-  ' "$BLOCKED_IPS_FILE" 2>/dev/null | sort -u
+    { gsub(/^[[:space:]]+|[[:space:]]+$/,""); if (length($0)) print $0 }
+  ' "$BLOCKED_IPS_FILE" 2>/dev/null | sort -u > "$tmp"
+  mv "$tmp" "$BLOCKED_IPS_FILE"
+}
+
+get_clean_blocklist(){
+  # Always read the canonicalized file
+  canonicalize_blocklist_file
+  cat "$BLOCKED_IPS_FILE"
 }
 
 create_default_blocked_ips_fallback(){
@@ -100,6 +108,7 @@ create_default_blocked_ips_fallback(){
 198.51.100.0/24
 203.0.113.0/24
 EOL
+  canonicalize_blocklist_file
 }
 
 update_blocklist(){
@@ -108,7 +117,12 @@ update_blocklist(){
   local tmp; tmp=$(mktemp)
   if curl -fsSL "$BLOCKLIST_URL" -o "$tmp"; then
     if [ -s "$tmp" ] && [ "$(wc -l < "$tmp")" -gt 10 ]; then
-      sed -i 's/\r$//' "$tmp"; mv "$tmp" "$BLOCKED_IPS_FILE"
+      sed -i 's/\r$//' "$tmp"
+      awk '
+        /^[[:space:]]*#/ { next }
+        { gsub(/^[[:space:]]+|[[:space:]]+$/,""); if (length($0)) print $0 }
+      ' "$tmp" | sort -u > "$BLOCKED_IPS_FILE"
+      rm -f "$tmp"
       echo -e "${GREEN}Blocklist updated.${NC}"
       [[ "$is_initial" == false ]] && prompt_to_apply
       return 0
@@ -119,11 +133,10 @@ update_blocklist(){
   return 1
 }
 
-# Ensure there is *something* in the blocklist before building rules
 ensure_blocklist_populated(){
   ensure_config_dir
-  local count
-  count=$(get_clean_blocklist | wc -l | tr -d ' ' || echo 0)
+  canonicalize_blocklist_file
+  local count; count=$(wc -l < "$BLOCKED_IPS_FILE" 2>/dev/null || echo 0)
   if [ "${count:-0}" -eq 0 ]; then
     update_blocklist true || create_default_blocked_ips_fallback
   fi
@@ -232,9 +245,9 @@ EOF
   [[ "$no_pause" == false ]] && press_enter_to_continue
 }
 
-# ---------------- Helpers for menus ----------------
 prompt_to_apply(){ apply_rules --no-pause; }
 
+# ---------------- Port helpers ----------------
 parse_and_process_ports(){
   local action="$1" proto_file="$2" input_ports="$3"
   local -i count=0
@@ -280,7 +293,7 @@ parse_and_process_ports(){
   printf '%s\n' "$count"
 }
 
-# IPv4/CIDR validation + add/remove (supports commas, spaces, newlines)
+# ---------------- IP helpers ----------------
 valid_ipv4_cidr(){
   local s="$1" ip mask
   ip=${s%%/*}; mask=${s#*/}
@@ -290,31 +303,51 @@ valid_ipv4_cidr(){
   if [[ -n "$mask" ]]; then [[ "$mask" =~ ^[0-9]+$ ]] && ((mask>=0 && mask<=32)) || return 1; fi
   return 0
 }
+
 parse_and_process_ips(){
   local action="$1" input_items="$2"
   local -i count=0
-  input_items=$(echo "$input_items" | tr ' \n' ',')   # accept spaces/newlines/commas
+  # Accept commas, spaces, or newlines as separators
+  input_items=$(echo "$input_items" | tr ' \n' ',')
   IFS=',' read -ra items <<< "$input_items"
+
+  canonicalize_blocklist_file
+
   for raw in "${items[@]}"; do
     local item; item=$(echo "$raw" | xargs)
     [[ -z "$item" ]] && continue
     if ! valid_ipv4_cidr "$item"; then
       echo -e " -> ${RED}Invalid IPv4/CIDR: $item${NC}" >&2; continue
     fi
+
     if [[ "$action" == "add" ]]; then
-      if ! grep -qxF "$item" "$BLOCKED_IPS_FILE"; then echo "$item" >> "$BLOCKED_IPS_FILE"; ((count++)); echo -e " -> ${GREEN}$item added.${NC}" >&2
-      else echo -e " -> ${YELLOW}$item already present.${NC}" >&2; fi
+      if ! grep -qxF "$item" "$BLOCKED_IPS_FILE"; then
+        echo "$item" >> "$BLOCKED_IPS_FILE"
+        canonicalize_blocklist_file
+        ((count++)); echo -e " -> ${GREEN}$item added.${NC}" >&2
+      else
+        echo -e " -> ${YELLOW}$item already present.${NC}" >&2
+      fi
     else
-      if grep -qxF "$item" "$BLOCKED_IPS_FILE"; then local esc="${item//\//\\/}"; sed -i "\#^${esc}$#d" "$BLOCKED_IPS_FILE"; ((count++)); echo -e " -> ${GREEN}$item removed.${NC}" >&2
-      else echo -e " -> ${YELLOW}$item not found.${NC}" >&2; fi
+      if grep -qxF "$item" "$BLOCKED_IPS_FILE"; then
+        local tmp; tmp=$(mktemp)
+        # Remove exact matches, no regex/escaping issues
+        grep -Fvx "$item" "$BLOCKED_IPS_FILE" > "$tmp" || true
+        mv "$tmp" "$BLOCKED_IPS_FILE"
+        canonicalize_blocklist_file
+        ((count++)); echo -e " -> ${GREEN}$item removed.${NC}" >&2
+      else
+        echo -e " -> ${YELLOW}$item not found.${NC}" >&2
+      fi
     fi
   done
+
   printf '%s\n' "$count"
 }
 
 # ---- Port/IP actions (submenu handles the pause) ----
 add_ports_interactive(){
-  local proto="$1" ; local proto_file
+  local proto="$1"; local proto_file
   [[ "$proto" == "TCP" ]] && proto_file="$ALLOWED_TCP_PORTS_FILE" || proto_file="$ALLOWED_UDP_PORTS_FILE"
   clear; echo -e "${YELLOW}--- Add Allowed ${proto} Ports ---${NC}"
   echo "Current ${proto} ports: $(sort -n "$proto_file" 2>/dev/null | paste -s -d, || echo "None")"
@@ -324,7 +357,7 @@ add_ports_interactive(){
   (( changed > 0 )) && { echo -e "${YELLOW}Applying firewall...${NC}"; apply_rules --no-pause; } || echo "No changes."
 }
 remove_ports_interactive(){
-  local proto="$1" ; local proto_file
+  local proto="$1"; local proto_file
   [[ "$proto" == "TCP" ]] && proto_file="$ALLOWED_TCP_PORTS_FILE" || proto_file="$ALLOWED_UDP_PORTS_FILE"
   clear; echo -e "${YELLOW}--- Remove Allowed ${proto} Ports ---${NC}"
   echo "Current ${proto} ports: $(sort -n "$proto_file" 2>/dev/null | paste -s -d, || echo "None")"
@@ -337,22 +370,47 @@ remove_ports_interactive(){
 # ---- Blocked IPs submenu ----
 manage_ips_menu(){
   while true; do
-    clear; echo "--- Manage Blocked IPs ---"
-    echo "Currently blocked (first 20):"
-    head -n 20 "$BLOCKED_IPS_FILE" 2>/dev/null | sed 's/^/  - /' || true
+    clear
+    canonicalize_blocklist_file
+    local total; total=$(wc -l < "$BLOCKED_IPS_FILE" 2>/dev/null || echo 0)
+    echo "--- Manage Blocked IPs ---"
+    echo "Total entries: ${total}"
+    echo "Preview (first 50):"
+    head -n 50 "$BLOCKED_IPS_FILE" 2>/dev/null | sed 's/^/  - /' || true
     echo
     echo "1) Add IP/CIDR (comma/space/newline separated)"
     echo "2) Remove IP/CIDR"
-    echo "3) Back"
+    echo "3) Show full list"
+    echo "4) Back"
     read -r -p "Choose an option: " choice < /dev/tty
     case $choice in
-      1) read -r -p "Enter IPs/CIDRs to ADD: " ips < /dev/tty
-         if [[ -n "$ips" ]]; then local changed; changed=$(parse_and_process_ips "add" "$ips"); (( changed > 0 )) && { echo -e "${YELLOW}Applying firewall...${NC}"; apply_rules --no-pause; }; fi
-         press_enter_to_continue ;;
-      2) read -r -p "Enter IPs/CIDRs to REMOVE: " ips < /dev/tty
-         if [[ -n "$ips" ]]; then local changed; changed=$(parse_and_process_ips "remove" "$ips"); (( changed > 0 )) && { echo -e "${YELLOW}Applying firewall...${NC}"; apply_rules --no-pause; }; fi
-         press_enter_to_continue ;;
-      3) break ;;
+      1)
+        read -r -p "Enter IPs/CIDRs to ADD: " ips < /dev/tty
+        if [[ -n "$ips" ]]; then
+          local changed; changed=$(parse_and_process_ips "add" "$ips")
+          (( changed > 0 )) && { echo -e "${YELLOW}Applying firewall...${NC}"; apply_rules --no-pause; }
+        fi
+        press_enter_to_continue
+        ;;
+      2)
+        read -r -p "Enter IPs/CIDRs to REMOVE: " ips < /dev/tty
+        if [[ -n "$ips" ]]; then
+          local changed; changed=$(parse_and_process_ips "remove" "$ips")
+          (( changed > 0 )) && { echo -e "${YELLOW}Applying firewall...${NC}"; apply_rules --no-pause; }
+        fi
+        press_enter_to_continue
+        ;;
+      3)
+        if command -v less >/dev/null 2>&1; then
+          less -S +"?." "$BLOCKED_IPS_FILE" </dev/tty
+        elif command -v more >/dev/null 2>&1; then
+          more "$BLOCKED_IPS_FILE" </dev/tty
+        else
+          cat "$BLOCKED_IPS_FILE"
+          press_enter_to_continue
+        fi
+        ;;
+      4) break ;;
       *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
     esac
   done
@@ -428,7 +486,7 @@ main_menu(){
   while true; do
     clear
     echo "==============================="
-    echo " NFTABLES FIREWALL MANAGER v7.1"
+    echo " NFTABLES FIREWALL MANAGER v7.2"
     echo "==============================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
