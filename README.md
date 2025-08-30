@@ -54,7 +54,7 @@ Managing iptables can be complex, especially on servers running Docker, which of
 
 ## Compatibility
 - **OS**: Ubuntu 20.04/22.04/24.04, Debian 11/12
--** Docker**: Supported (rules injected via `DOCKER-USER` when available)
+- **Docker**: Supported (rules injected via `DOCKER-USER` when available)
 - **IP version**: IPv4 (`iptables`). If your host has public IPv6, manage `ip6tables` separately or disable IPv6 to avoid exposure.
 
 ## How Docker is handled (1-liner)
