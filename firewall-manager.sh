@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =================================================================
-#  Interactive NFTABLES Firewall Manager - v7.0
+#  Interactive NFTABLES Firewall Manager - v7.1
 # =================================================================
 # - First run ONLY: apt update/upgrade + install deps (nftables, curl)
 # - Subsequent runs: NO apt checks / installs
@@ -125,7 +125,6 @@ ensure_blocklist_populated(){
   local count
   count=$(get_clean_blocklist | wc -l | tr -d ' ' || echo 0)
   if [ "${count:-0}" -eq 0 ]; then
-    # Try remote list; if it fails, seed a safe fallback
     update_blocklist true || create_default_blocked_ips_fallback
   fi
 }
@@ -174,40 +173,49 @@ apply_rules(){
   # Build fresh table
   local tmp_rules; tmp_rules=$(mktemp)
   {
-    echo "table inet firewall-manager {"
-    echo "  chain input {"
-    echo "    type filter hook input priority 0; policy drop;"
-    echo "    ct state { established, related } accept"
-    echo "    iif lo accept"
-    echo "    ct state invalid drop"
+    cat <<EOF
+table inet firewall-manager {
+  chain input {
+    type filter hook input priority 0; policy drop;
+    ct state { established, related } accept
+    iif lo accept
+    ct state invalid drop
+EOF
     if ((${#BLOCKED_CLEAN[@]})); then
       for ip in "${BLOCKED_CLEAN[@]}"; do
-        echo "    ip saddr ${ip} drop"
+        printf '    ip saddr %s drop\n' "$ip"
       done
     fi
-    echo "    tcp dport ${ssh_port} accept"
-    [[ -n "$tcp_ports" ]] && echo "    tcp dport { ${tcp_ports} } accept"
-    [[ -n "$udp_ports" ]] && echo "    udp dport { ${udp_ports} } accept"
-    echo "  }"
-    echo
-    echo "  chain forward {"
-    echo "    type filter hook forward priority 0; policy drop;"
+    printf '    tcp dport %s accept\n' "$ssh_port"
+    [[ -n "$tcp_ports" ]] && printf '    tcp dport { %s } accept\n' "$tcp_ports"
+    [[ -n "$udp_ports" ]] && printf '    udp dport { %s } accept\n' "$udp_ports"
+
+    cat <<'EOF'
+  }
+  chain forward {
+    type filter hook forward priority 0; policy drop;
+EOF
     if ((${#BLOCKED_CLEAN[@]})); then
       for ip in "${BLOCKED_CLEAN[@]}"; do
-        echo "    ip saddr ${ip} drop"
+        printf '    ip saddr %s drop\n' "$ip"
       done
     fi
-    echo "  }"
-    echo
-    echo "  chain output {"
-    echo "    type filter hook output priority 0; policy accept;"
+
+    cat <<'EOF'
+  }
+  chain output {
+    type filter hook output priority 0; policy accept;
+EOF
     if ((${#BLOCKED_CLEAN[@]})); then
       for ip in "${BLOCKED_CLEAN[@]}"; do
-        echo "    ip daddr ${ip} drop"
+        printf '    ip daddr %s drop\n' "$ip"
       done
-    fi"
-    echo "  }"
-    echo "}"
+    fi
+
+    cat <<'EOF'
+  }
+}
+EOF
   } > "$tmp_rules"
 
   if nft -f "$tmp_rules"; then
@@ -304,8 +312,9 @@ parse_and_process_ips(){
   printf '%s\n' "$count"
 }
 
-# ---- Port/IP actions (no pause here: submenu handles it) ----
-add_ports_interactive(){ local proto="$1" ; local proto_file
+# ---- Port/IP actions (submenu handles the pause) ----
+add_ports_interactive(){
+  local proto="$1" ; local proto_file
   [[ "$proto" == "TCP" ]] && proto_file="$ALLOWED_TCP_PORTS_FILE" || proto_file="$ALLOWED_UDP_PORTS_FILE"
   clear; echo -e "${YELLOW}--- Add Allowed ${proto} Ports ---${NC}"
   echo "Current ${proto} ports: $(sort -n "$proto_file" 2>/dev/null | paste -s -d, || echo "None")"
@@ -314,7 +323,8 @@ add_ports_interactive(){ local proto="$1" ; local proto_file
   local changed; changed=$(parse_and_process_ports "add" "$proto_file" "$input_ports")
   (( changed > 0 )) && { echo -e "${YELLOW}Applying firewall...${NC}"; apply_rules --no-pause; } || echo "No changes."
 }
-remove_ports_interactive(){ local proto="$1" ; local proto_file
+remove_ports_interactive(){
+  local proto="$1" ; local proto_file
   [[ "$proto" == "TCP" ]] && proto_file="$ALLOWED_TCP_PORTS_FILE" || proto_file="$ALLOWED_UDP_PORTS_FILE"
   clear; echo -e "${YELLOW}--- Remove Allowed ${proto} Ports ---${NC}"
   echo "Current ${proto} ports: $(sort -n "$proto_file" 2>/dev/null | paste -s -d, || echo "None")"
@@ -418,7 +428,7 @@ main_menu(){
   while true; do
     clear
     echo "==============================="
-    echo " NFTABLES FIREWALL MANAGER v7.0"
+    echo " NFTABLES FIREWALL MANAGER v7.1"
     echo "==============================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
