@@ -2,15 +2,15 @@
 set -euo pipefail
 
 # =================================================================
-#  Interactive NFTABLES Firewall Manager - v7.5
+#  Interactive NFTABLES Firewall Manager - v7.6
 # =================================================================
-# First-run ONLY: apt update/upgrade + install deps (nftables,curl)
-# Detect & auto-allow current SSH port
-# Manage TCP/UDP ports (auto-apply; stays in submenu)
-# Manage Blocked IPs (IPv4/CIDR add/remove; auto-apply; stays in submenu)
-# Auto-populate & canonicalize blocklist
-# Clean table reload: delete-if-exists, then create fresh
-# Forward: only ip saddr drops (cleaner)
+# - First-run ONLY: apt update/upgrade + install deps (nftables, curl)
+# - Detect & auto-allow current SSH port
+# - Manage TCP/UDP ports (auto-apply; stays in submenu)
+# - Manage Blocked IPs (IPv4/CIDR add/remove; auto-apply; stays in submenu)
+# - Auto-populate & canonicalize blocklist
+# - Docker-aware FORWARD rules (bridged networking works)
+# - Clean table reload: delete-if-exists, then create fresh
 # =================================================================
 
 # --- CONFIG ---
@@ -79,11 +79,7 @@ canonicalize_blocklist_file(){
   ' "$BLOCKED_IPS_FILE" 2>/dev/null | sort -u > "$tmp"
   mv "$tmp" "$BLOCKED_IPS_FILE"
 }
-
-get_clean_blocklist(){
-  canonicalize_blocklist_file
-  cat "$BLOCKED_IPS_FILE"
-}
+get_clean_blocklist(){ canonicalize_blocklist_file; cat "$BLOCKED_IPS_FILE"; }
 
 create_default_blocked_ips_fallback(){
   cat > "$BLOCKED_IPS_FILE" << 'EOL'
@@ -118,7 +114,7 @@ update_blocklist(){
   fi
   echo -e "${RED}Blocklist download failed or too small. Keeping existing.${NC}"
   rm -f "$tmp" || true
-  return 1
+  return 0   # never break the main menu
 }
 
 ensure_blocklist_populated(){
@@ -128,6 +124,13 @@ ensure_blocklist_populated(){
   if [ "${count:-0}" -eq 0 ]; then
     update_blocklist true || create_default_blocked_ips_fallback
   fi
+}
+
+# ---------------- Docker detection ----------------
+get_docker_ifaces(){
+  ip -o link show 2>/dev/null \
+   | awk -F': ' '{print $2}' \
+   | awk '/^(docker0|br-)/{print $1}'
 }
 
 # ---------------- Apply nft rules ----------------
@@ -146,8 +149,9 @@ apply_rules(){
   tcp_ports=$({ sort -un "$ALLOWED_TCP_PORTS_FILE" 2>/dev/null | grep -v -x "${ssh_port}" || true; } | tr '\n' ',' | sed 's/,$//')
   udp_ports=$({ sort -un "$ALLOWED_UDP_PORTS_FILE"  2>/dev/null || true; } | tr '\n' ',' | sed 's/,$//')
 
-  declare -a BLOCKED_CLEAN=()
+  declare -a BLOCKED_CLEAN=() DOCKER_IFACES=()
   mapfile -t BLOCKED_CLEAN < <(get_clean_blocklist) || true
+  mapfile -t DOCKER_IFACES  < <(get_docker_ifaces)   || true
 
   nft list table inet firewall-manager >/dev/null 2>&1 && nft delete table inet firewall-manager
 
@@ -172,7 +176,17 @@ EOF
   }
   chain forward {
     type filter hook forward priority 0; policy drop;
+    ct state { established, related } accept
+    ct state invalid drop
 EOF
+    # Docker bridges permitted (both directions)
+    if ((${#DOCKER_IFACES[@]})); then
+      for ifc in "${DOCKER_IFACES[@]}"; do
+        printf '    iifname "%s" accept\n' "$ifc"
+        printf '    oifname "%s" accept\n' "$ifc"
+      done
+    fi
+    # Optional: blocklist on FORWARD, if you still want it here
     if ((${#BLOCKED_CLEAN[@]})); then
       for ip in "${BLOCKED_CLEAN[@]}"; do printf '    ip saddr %s drop\n' "$ip"; done
     fi
@@ -253,7 +267,6 @@ valid_ipv4_cidr(){
   if [[ -n "$mask" ]]; then [[ "$mask" =~ ^[0-9]+$ ]] && ((mask>=0 && mask<=32)) || return 1; fi
   return 0
 }
-
 parse_and_process_ips(){
   local action="$1" input_items="$2"
   local -i count=0
@@ -315,20 +328,14 @@ manage_ips_menu(){
 
     local did_change=0
     case $choice in
-      1)
-        read -r -p "Enter IPs/CIDRs to ADD: " ips < /dev/tty
-        if [[ -n "$ips" ]]; then local changed; changed=$(parse_and_process_ips "add" "$ips"); (( changed > 0 )) && did_change=1; fi
-        ;;
-      2)
-        read -r -p "Enter IPs/CIDRs to REMOVE: " ips < /dev/tty
-        if [[ -n "$ips" ]]; then local changed; changed=$(parse_and_process_ips "remove" "$ips"); (( changed > 0 )) && did_change=1; fi
-        ;;
-      3)
-        if command -v less >/dev/null 2>&1; then less -S "$BLOCKED_IPS_FILE" </dev/tty || true
-        elif command -v more >/dev/null 2>&1; then more "$BLOCKED_IPS_FILE" </dev/tty || true
-        else cat "$BLOCKED_IPS_FILE"; press_enter_to_continue; fi
-        continue
-        ;;
+      1) read -r -p "Enter IPs/CIDRs to ADD: " ips < /dev/tty
+         if [[ -n "$ips" ]]; then local changed; changed=$(parse_and_process_ips "add" "$ips"); (( changed > 0 )) && did_change=1; fi ;;
+      2) read -r -p "Enter IPs/CIDRs to REMOVE: " ips < /dev/tty
+         if [[ -n "$ips" ]]; then local changed; changed=$(parse_and_process_ips "remove" "$ips"); (( changed > 0 )) && did_change=1; fi ;;
+      3) if command -v less >/dev/null 2>&1; then less -S "$BLOCKED_IPS_FILE" </dev/tty || true
+         elif command -v more >/dev/null 2>&1; then more "$BLOCKED_IPS_FILE" </dev/tty || true
+         else cat "$BLOCKED_IPS_FILE"; press_enter_to_continue; fi
+         continue ;;
       4) break ;;
       *) echo -e "${RED}Invalid option.${NC}"; sleep 1; continue ;;
     esac
@@ -408,7 +415,6 @@ uninstall_script(){
 }
 
 initial_setup(){
-  # If config dir already exists (after prepare_system), we still ensure SSH port present
   ensure_config_dir
   local ssh_port; ssh_port=$(detect_ssh_port)
   echo -e "${GREEN}Detected SSH on ${ssh_port}/tcp; it will be allowed automatically.${NC}"
@@ -420,7 +426,7 @@ main_menu(){
   while true; do
     clear
     echo "==============================="
-    echo " NFTABLES FIREWALL MANAGER v7.5"
+    echo " NFTABLES FIREWALL MANAGER v7.6"
     echo "==============================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
@@ -439,7 +445,7 @@ main_menu(){
       3) manage_tcp_ports_menu ;;
       4) manage_udp_ports_menu ;;
       5) manage_ips_menu ;;
-      6) update_blocklist; press_enter_to_continue ;;
+      6) update_blocklist || true; press_enter_to_continue ;;  # never exit the menu
       7) flush_rules ;;
       8) uninstall_script ;;
       9) exit 0 ;;
