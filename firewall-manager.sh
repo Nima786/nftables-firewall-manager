@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =================================================================
-#  Interactive NFTABLES Firewall Manager - v7.6
+#  Interactive NFTABLES Firewall Manager - v7.7
 # =================================================================
 # - First-run ONLY: apt update/upgrade + install deps (nftables, curl)
 # - Detect & auto-allow current SSH port
@@ -10,6 +10,7 @@ set -euo pipefail
 # - Manage Blocked IPs (IPv4/CIDR add/remove; auto-apply; stays in submenu)
 # - Auto-populate & canonicalize blocklist
 # - Docker-aware FORWARD rules (bridged networking works)
+# - FORWARD: drop blocked DESTINATIONS before Docker accepts (fixes netscan)
 # - Clean table reload: delete-if-exists, then create fresh
 # =================================================================
 
@@ -91,6 +92,7 @@ create_default_blocked_ips_fallback(){
 192.0.2.0/24
 198.51.100.0/24
 203.0.113.0/24
+198.18.0.0/15
 EOL
   canonicalize_blocklist_file
 }
@@ -179,6 +181,11 @@ EOF
     ct state { established, related } accept
     ct state invalid drop
 EOF
+    # NEW: Drop forwarded packets to blocked destinations BEFORE Docker accepts
+    if ((${#BLOCKED_CLEAN[@]})); then
+      for ip in "${BLOCKED_CLEAN[@]}"; do printf '    ip daddr %s drop\n' "$ip"; done
+    fi
+
     # Docker bridges permitted (both directions)
     if ((${#DOCKER_IFACES[@]})); then
       for ifc in "${DOCKER_IFACES[@]}"; do
@@ -186,7 +193,8 @@ EOF
         printf '    oifname "%s" accept\n' "$ifc"
       done
     fi
-    # Optional: blocklist on FORWARD, if you still want it here
+
+    # (Optional) also drop forwarded packets from blocked sources
     if ((${#BLOCKED_CLEAN[@]})); then
       for ip in "${BLOCKED_CLEAN[@]}"; do printf '    ip saddr %s drop\n' "$ip"; done
     fi
@@ -426,7 +434,7 @@ main_menu(){
   while true; do
     clear
     echo "==============================="
-    echo " NFTABLES FIREWALL MANAGER v7.6"
+    echo " NFTABLES FIREWALL MANAGER v7.7"
     echo "==============================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
@@ -445,7 +453,7 @@ main_menu(){
       3) manage_tcp_ports_menu ;;
       4) manage_udp_ports_menu ;;
       5) manage_ips_menu ;;
-      6) update_blocklist || true; press_enter_to_continue ;;  # never exit the menu
+      6) update_blocklist || true; press_enter_to_continue ;;  # stay in menu
       7) flush_rules ;;
       8) uninstall_script ;;
       9) exit 0 ;;
