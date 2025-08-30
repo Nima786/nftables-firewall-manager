@@ -2,16 +2,25 @@
 set -euo pipefail
 
 # =================================================================
-#  Interactive NFTABLES Firewall Manager - v6.6
+#  Interactive NFTABLES Firewall Manager - v6.7
 # =================================================================
-# - First run: apt update && apt upgrade (tracked by state file)
-# - Subsequent runs: quick apt metadata refresh only
+# - First run ONLY: apt update/upgrade + install deps (nftables, curl)
+# - Subsequent runs: NO apt/network checks and NO package installs
 # - Detects & auto-allows current SSH port
-# - Installs deps (nftables, curl)
 # - Overlap-safe blocklist (per-rule drops; no interval sets)
-# - Deterministic load: delete table if it exists, then create fresh
+# - Clean table reload: delete-if-exists, then create fresh
 # - TCP/UDP submenus: stay open; changes auto-apply (no prompt)
-# - Forward chain: only ip saddr drops (avoid duplicate-looking lines)
+# - Forward chain: only ip saddr drops (cleaner output)
+#
+# Menu:
+#   1) View rules
+#   2) Apply now
+#   3) Manage TCP
+#   4) Manage UDP
+#   5) Update blocklist
+#   6) Flush rules & reset config
+#   7) Uninstall firewall & script  ← (back, before Exit)
+#   8) Exit
 
 # --- CONFIG ---
 CONFIG_DIR="/etc/firewall_manager_nft"
@@ -19,13 +28,12 @@ ALLOWED_TCP_PORTS_FILE="$CONFIG_DIR/allowed_tcp_ports.conf"
 ALLOWED_UDP_PORTS_FILE="$CONFIG_DIR/allowed_udp_ports.conf"
 BLOCKED_IPS_FILE="$CONFIG_DIR/blocked_ips.conf"
 BLOCKLIST_URL="https://raw.githubusercontent.com/Kiya6955/Abuse-Defender/main/abuse-ips.ipv4"
-STATE_FILE="$CONFIG_DIR/.first_run_done"
+FIRST_RUN_STATE="$CONFIG_DIR/.system_prep_done"   # set only by prepare_system()
 
 # --- COLORS ---
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 
 press_enter_to_continue(){ echo ""; read -r -p "Press Enter to return..." < /dev/tty; }
-
 ensure_config_dir(){
   mkdir -p "$CONFIG_DIR"
   [ -f "$ALLOWED_TCP_PORTS_FILE" ] || touch "$ALLOWED_TCP_PORTS_FILE"
@@ -33,33 +41,24 @@ ensure_config_dir(){
   [ -f "$BLOCKED_IPS_FILE" ]      || touch "$BLOCKED_IPS_FILE"
 }
 
-# ---------------- System prep & deps ----------------
+# ---------------- First-run ONLY: system prep & deps ----------------
 prepare_system(){
-  echo "[+] Checking apt metadata & dependencies..."
   export DEBIAN_FRONTEND=noninteractive
-
-  if [ ! -f "$STATE_FILE" ]; then
-    echo "[+] First run detected: apt update && apt upgrade..."
-    apt-get update -y
-    apt-get -y upgrade || true
-  else
-    apt-get update -y >/dev/null 2>&1 || true
+  ensure_config_dir
+  if [ -f "$FIRST_RUN_STATE" ]; then
+    echo "[+] First-run system prep already done; skipping updates & installs."
+    return 0
   fi
 
-  local pkgs=()
-  command -v nft  >/dev/null 2>&1 || pkgs+=("nftables")
-  command -v curl >/dev/null 2>&1 || pkgs+=("curl")
-  if ((${#pkgs[@]})); then
-    echo "[+] Installing: ${pkgs[*]}"
-    apt-get install -y "${pkgs[@]}"
-  fi
-
-  if ! command -v nft >/dev/null 2>&1; then
-    echo -e "${RED}FATAL: nftables not available after install.${NC}"; exit 1
-  fi
+  echo "[+] First run detected: updating system and installing dependencies..."
+  apt-get update -y
+  apt-get -y upgrade || true
+  apt-get install -y nftables curl
   systemctl enable nftables.service >/dev/null 2>&1 || true
   systemctl start  nftables.service  >/dev/null 2>&1 || true
-  echo -e "${GREEN}System ready. Dependencies OK.${NC}"
+
+  touch "$FIRST_RUN_STATE"
+  echo -e "${GREEN}Initial system preparation complete.${NC}"
 }
 
 # ---------------- SSH port detection ----------------
@@ -75,11 +74,7 @@ detect_ssh_port(){
   [[ "$port" =~ ^[0-9]+$ ]] && ((port>=1 && port<=65535)) || port=22
   echo "$port"
 }
-
-ensure_ssh_in_config(){
-  local ssh_port; ssh_port=$(detect_ssh_port)
-  grep -qx "$ssh_port" "$ALLOWED_TCP_PORTS_FILE" || echo "$ssh_port" >> "$ALLOWED_TCP_PORTS_FILE"
-}
+ensure_ssh_in_config(){ local ssh_port; ssh_port=$(detect_ssh_port); grep -qx "$ssh_port" "$ALLOWED_TCP_PORTS_FILE" || echo "$ssh_port" >> "$ALLOWED_TCP_PORTS_FILE"; }
 
 # ---------------- Blocklist handling ----------------
 update_blocklist(){
@@ -98,7 +93,6 @@ update_blocklist(){
   rm -f "$tmp" || true
   return 1
 }
-
 create_default_blocked_ips_fallback(){
   cat > "$BLOCKED_IPS_FILE" << 'EOL'
 # FALLBACK LIST
@@ -107,16 +101,13 @@ create_default_blocked_ips_fallback(){
 192.168.0.0/16
 EOL
 }
+get_clean_blocklist(){ awk '
+  /^[[:space:]]*#/ { next }
+  /^[[:space:]]*$/ { next }
+  { gsub(/\r/,""); gsub(/^[[:space:]]+|[[:space:]]+$/,""); if (length($0)>0) print $0 }
+' "$BLOCKED_IPS_FILE" | sort -u; }
 
-get_clean_blocklist(){
-  awk '
-    /^[[:space:]]*#/ { next }
-    /^[[:space:]]*$/ { next }
-    { gsub(/\r/,""); gsub(/^[[:space:]]+|[[:space:]]+$/,""); if (length($0)>0) print $0 }
-  ' "$BLOCKED_IPS_FILE" | sort -u
-}
-
-# ---------------- First-time setup ----------------
+# ---------------- First-time setup (config only) ----------------
 initial_setup(){
   if [ ! -d "$CONFIG_DIR" ]; then
     echo -e "${YELLOW}First-time setup: creating configuration...${NC}"
@@ -131,7 +122,6 @@ initial_setup(){
     add_ports_interactive "TCP" --no-prompt
     echo -e "\n${GREEN}Initial configuration complete.${NC}"
     echo "Select 'Apply Firewall Rules' to activate."
-    touch "$STATE_FILE"
     press_enter_to_continue
   else
     ensure_ssh_in_config
@@ -178,7 +168,7 @@ apply_rules(){
     echo
     echo "  chain forward {"
     echo "    type filter hook forward priority 0; policy drop;"
-    # Source-side drops (cleaner; blocks spoofed scans)
+    # Source-side drops (cleaner; still blocks spoofed scans)
     for ip in "${BLOCKED_CLEAN[@]:-}"; do
       echo "    ip saddr ${ip} drop"
     done
@@ -212,7 +202,7 @@ prompt_to_apply(){ apply_rules --no-pause; }  # used after blocklist update
 
 parse_and_process_ports(){
   local action="$1" proto_file="$2" input_ports="$3"
-  local count=0
+  local -i count=0
   local ssh_port; ssh_port=$(detect_ssh_port)
 
   IFS=',' read -ra port_items <<< "$input_ports"
@@ -266,7 +256,7 @@ parse_and_process_ports(){
     fi
   done
 
-  # ONLY the numeric count goes to stdout (caller captures it)
+  # only the numeric count goes to stdout
   printf '%s\n' "$count"
 }
 
@@ -312,34 +302,6 @@ remove_ports_interactive(){
 
 view_rules(){ clear; echo -e "${YELLOW}--- Current Active NFTABLES Ruleset ---${NC}"; nft list ruleset; press_enter_to_continue; }
 
-manage_tcp_ports_menu(){
-  while true; do
-    clear; echo "--- Manage Allowed TCP Ports ---"
-    echo "1) Add TCP Port(s)"; echo "2) Remove TCP Port(s)"; echo "3) Back"
-    read -r -p "Choose an option: " choice < /dev/tty
-    case $choice in
-      1) add_ports_interactive "TCP" ;;
-      2) remove_ports_interactive "TCP" ;;
-      3) break ;;
-      *) echo -e "${RED}Invalid option.${NC}" && sleep 1 ;;
-    esac
-  done
-}
-
-manage_udp_ports_menu(){
-  while true; do
-    clear; echo "--- Manage Allowed UDP Ports ---"
-    echo "1) Add UDP Port(s)"; echo "2) Remove UDP Port(s)"; echo "3) Back"
-    read -r -p "Choose an option: " choice < /dev/tty
-    case $choice in
-      1) add_ports_interactive "UDP" ;;
-      2) remove_ports_interactive "UDP" ;;
-      3) break ;;
-      *) echo -e "${RED}Invalid option.${NC}" && sleep 1 ;;
-    esac
-  done
-}
-
 flush_rules(){
   clear
   read -r -p "ARE YOU SURE? This will flush all rules and reset the configuration. (y/n): " confirm < /dev/tty
@@ -377,11 +339,39 @@ uninstall_script(){
   press_enter_to_continue
 }
 
+manage_tcp_ports_menu(){
+  while true; do
+    clear; echo "--- Manage Allowed TCP Ports ---"
+    echo "1) Add TCP Port(s)"; echo "2) Remove TCP Port(s)"; echo "3) Back"
+    read -r -p "Choose an option: " choice < /dev/tty
+    case $choice in
+      1) add_ports_interactive "TCP" ;;
+      2) remove_ports_interactive "TCP" ;;
+      3) break ;;
+      *) echo -e "${RED}Invalid option.${NC}" && sleep 1 ;;
+    esac
+  done
+}
+
+manage_udp_ports_menu(){
+  while true; do
+    clear; echo "--- Manage Allowed UDP Ports ---"
+    echo "1) Add UDP Port(s)"; echo "2) Remove UDP Port(s)"; echo "3) Back"
+    read -r -p "Choose an option: " choice < /dev/tty
+    case $choice in
+      1) add_ports_interactive "UDP" ;;
+      2) remove_ports_interactive "UDP" ;;
+      3) break ;;
+      *) echo -e "${RED}Invalid option.${NC}" && sleep 1 ;;
+    esac
+  done
+}
+
 main_menu(){
   while true; do
     clear
     echo "==============================="
-    echo " NFTABLES FIREWALL MANAGER v6.6"
+    echo " NFTABLES FIREWALL MANAGER v6.7"
     echo "==============================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
@@ -412,6 +402,6 @@ if [ "$(id -u)" -ne 0 ]; then
   echo -e "${RED}This script must be run as root. Please use sudo.${NC}" >&2
   exit 1
 fi
-prepare_system
-initial_setup
+prepare_system          # runs ONLY once; skipped afterwards
+initial_setup           # creates config dir if missing
 main_menu
