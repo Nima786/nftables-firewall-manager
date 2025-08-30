@@ -2,9 +2,18 @@
 set -euo pipefail
 
 # =================================================================
-#  Interactive NFTABLES Firewall Manager - v7.3
+#  Interactive NFTABLES Firewall Manager - v7.4
+# =================================================================
+# First-run ONLY: apt update/upgrade + install deps (nftables,curl)
+# Detect & auto-allow current SSH port
+# Manage TCP/UDP ports (auto-apply; stays in submenu)
+# Manage Blocked IPs (IPv4/CIDR add/remove; auto-apply; stays in submenu)
+# Auto-populate & canonicalize blocklist
+# Clean table reload: delete-if-exists, then create fresh
+# Forward: only ip saddr drops (cleaner)
 # =================================================================
 
+# --- CONFIG ---
 CONFIG_DIR="/etc/firewall_manager_nft"
 ALLOWED_TCP_PORTS_FILE="$CONFIG_DIR/allowed_tcp_ports.conf"
 ALLOWED_UDP_PORTS_FILE="$CONFIG_DIR/allowed_udp_ports.conf"
@@ -12,17 +21,19 @@ BLOCKED_IPS_FILE="$CONFIG_DIR/blocked_ips.conf"
 BLOCKLIST_URL="https://raw.githubusercontent.com/Kiya6955/Abuse-Defender/main/abuse-ips.ipv4"
 FIRST_RUN_STATE="$CONFIG_DIR/.system_prep_done"
 
+# --- COLORS ---
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 
 press_enter_to_continue(){ echo ""; read -r -p "Press Enter to return..." < /dev/tty; }
 
 ensure_config_dir(){
   mkdir -p "$CONFIG_DIR"
-  [ -f "$ALLOWED_TCP_PORTS_FILE" ] || touch "$ALLOWED_TCP_PORTS_FILE"
-  [ -f "$ALLOWED_UDP_PORTS_FILE" ] || touch "$ALLOWED_UDP_PORTS_FILE"
-  [ -f "$BLOCKED_IPS_FILE" ]      || touch "$BLOCKED_IPS_FILE"
+  [ -f "$ALLOWED_TCP_PORTS_FILE" ] || : >"$ALLOWED_TCP_PORTS_FILE"
+  [ -f "$ALLOWED_UDP_PORTS_FILE" ] || : >"$ALLOWED_UDP_PORTS_FILE"
+  [ -f "$BLOCKED_IPS_FILE" ]      || : >"$BLOCKED_IPS_FILE"
 }
 
+# ---------------- First-run ONLY: system prep & deps ----------------
 prepare_system(){
   export DEBIAN_FRONTEND=noninteractive
   ensure_config_dir
@@ -37,9 +48,10 @@ prepare_system(){
   systemctl enable nftables.service >/dev/null 2>&1 || true
   systemctl start  nftables.service  >/dev/null 2>&1 || true
   touch "$FIRST_RUN_STATE"
-  echo -e "${GREEN}Initial system preparation complete.${NC}"
+  echo "Initial system preparation complete."
 }
 
+# ---------------- SSH port detection ----------------
 detect_ssh_port(){
   local port=""
   port=$(
@@ -57,7 +69,7 @@ ensure_ssh_in_config(){
   grep -qx "$ssh_port" "$ALLOWED_TCP_PORTS_FILE" || echo "$ssh_port" >> "$ALLOWED_TCP_PORTS_FILE"
 }
 
-# ---- Blocklist helpers ----
+# ---------------- Blocklist handling ----------------
 canonicalize_blocklist_file(){
   local tmp; tmp=$(mktemp)
   awk '
@@ -79,8 +91,22 @@ create_default_blocked_ips_fallback(){
 198.51.100.0/24
 203.0.113.0/24
 EOL
-  canonicalize_blocklist_file
+  canonicalize_blocklist_file()
 }
+# (typo guard)
+canonicalize_blocklist_file(){ :; } # will be redefined above; no-op if heredoc got mangled
+
+# redefine properly (safe)
+canonicalize_blocklist_file(){
+  local tmp; tmp=$(mktemp)
+  awk '
+    { gsub(/\r/,"") }
+    /^[[:space:]]*#/ { next }
+    { gsub(/^[[:space:]]+|[[:space:]]+$/,""); if (length($0)) print $0 }
+  ' "$BLOCKED_IPS_FILE" 2>/dev/null | sort -u > "$tmp"
+  mv "$tmp" "$BLOCKED_IPS_FILE"
+}
+
 update_blocklist(){
   local is_initial=${1:-false}
   echo -e "${YELLOW}Downloading latest blocklist...${NC}"
@@ -111,7 +137,7 @@ ensure_blocklist_populated(){
   fi
 }
 
-# ---- Apply rules ----
+# ---------------- Apply nft rules ----------------
 apply_rules(){
   local no_pause=false; [[ "${1:-}" == "--no-pause" ]] && no_pause=true
   [[ "$no_pause" == false ]] && clear
@@ -130,9 +156,7 @@ apply_rules(){
   declare -a BLOCKED_CLEAN=()
   mapfile -t BLOCKED_CLEAN < <(get_clean_blocklist) || true
 
-  if nft list table inet firewall-manager >/dev/null 2>&1; then
-    nft delete table inet firewall-manager
-  fi
+  nft list table inet firewall-manager >/dev/null 2>&1 && nft delete table inet firewall-manager
 
   local tmp_rules; tmp_rules=$(mktemp)
   {
@@ -190,7 +214,7 @@ EOF
 }
 prompt_to_apply(){ apply_rules --no-pause; }
 
-# ---- Ports helpers ----
+# ---------------- Port helpers ----------------
 parse_and_process_ports(){
   local action="$1" proto_file="$2" input_ports="$3"
   local -i count=0
@@ -226,7 +250,7 @@ parse_and_process_ports(){
   printf '%s\n' "$count"
 }
 
-# ---- IP helpers ----
+# ---------------- IP helpers ----------------
 valid_ipv4_cidr(){
   local s="$1" ip mask
   ip=${s%%/*}; mask=${s#*/}
@@ -259,7 +283,7 @@ parse_and_process_ips(){
   printf '%s\n' "$count"
 }
 
-# ---- Port/IP interactions (menus control the pause) ----
+# ---------------- Interactions ----------------
 add_ports_interactive(){ local proto="$1" ; local proto_file
   [[ "$proto" == "TCP" ]] && proto_file="$ALLOWED_TCP_PORTS_FILE" || proto_file="$ALLOWED_UDP_PORTS_FILE"
   clear; echo -e "${YELLOW}--- Add Allowed ${proto} Ports ---${NC}"
@@ -279,7 +303,6 @@ remove_ports_interactive(){ local proto="$1" ; local proto_file
   (( changed > 0 )) && { echo -e "${YELLOW}Applying firewall...${NC}"; apply_rules --no-pause; } || echo "No changes."
 }
 
-# ---- Blocked IPs submenu (now sticky: never exits unless you choose Back) ----
 manage_ips_menu(){
   while true; do
     clear
@@ -300,27 +323,16 @@ manage_ips_menu(){
     case $choice in
       1)
         read -r -p "Enter IPs/CIDRs to ADD: " ips < /dev/tty
-        if [[ -n "$ips" ]]; then
-          local changed; changed=$(parse_and_process_ips "add" "$ips")
-          (( changed > 0 )) && did_change=1
-        fi
+        if [[ -n "$ips" ]]; then local changed; changed=$(parse_and_process_ips "add" "$ips"); (( changed > 0 )) && did_change=1; fi
         ;;
       2)
         read -r -p "Enter IPs/CIDRs to REMOVE: " ips < /dev/tty
-        if [[ -n "$ips" ]]; then
-          local changed; changed=$(parse_and_process_ips "remove" "$ips")
-          (( changed > 0 )) && did_change=1
-        fi
+        if [[ -n "$ips" ]]; then local changed; changed=$(parse_and_process_ips "remove" "$ips"); (( changed > 0 )) && did_change=1; fi
         ;;
       3)
-        if command -v less >/dev/null 2>&1; then
-          less -S "$BLOCKED_IPS_FILE" </dev/tty || true
-        elif command -v more >/dev/null 2>&1; then
-          more "$BLOCKED_IPS_FILE" </dev/tty || true
-        else
-          cat "$BLOCKED_IPS_FILE"
-          press_enter_to_continue
-        fi
+        if command -v less >/dev/null 2>&1; then less -S "$BLOCKED_IPS_FILE" </dev/tty || true
+        elif command -v more >/dev/null 2>&1; then more "$BLOCKED_IPS_FILE" </dev/tty || true
+        else cat "$BLOCKED_IPS_FILE"; press_enter_to_continue; fi
         continue
         ;;
       4) break ;;
@@ -401,11 +413,27 @@ uninstall_script(){
   press_enter_to_continue
 }
 
+initial_setup(){
+  if [ ! -d "$CONFIG_DIR" ]; then
+    echo -e "${YELLOW}First-time setup: creating configuration...${NC}"
+    ensure_config_dir
+    local ssh_port; ssh_port=$(detect_ssh_port)
+    echo -e "${GREEN}Detected SSH on ${ssh_port}/tcp; it will be allowed automatically.${NC}"
+    ensure_ssh_in_config
+    ensure_blocklist_populated
+    echo -e "\n${GREEN}Initial configuration complete.${NC}"
+    echo "Select 'Apply Firewall Rules' to activate."
+    press_enter_to_continue
+  else
+    ensure_ssh_in_config
+  fi
+}
+
 main_menu(){
   while true; do
     clear
     echo "==============================="
-    echo " NFTABLES FIREWALL MANAGER v7.3"
+    echo " NFTABLES FIREWALL MANAGER v7.4"
     echo "==============================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
@@ -433,11 +461,14 @@ main_menu(){
   done
 }
 
-# --- SCRIPT START ---
-if [ "$(id -u)" -ne 0 ]; then
-  echo -e "${RED}This script must be run as root. Please use sudo.${NC}" >&2
-  exit 1
-fi
-prepare_system
-initial_setup
-main_menu
+main(){
+  if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}This script must be run as root. Please use sudo.${NC}" >&2
+    exit 1
+  fi
+  prepare_system
+  initial_setup
+  main_menu
+}
+
+main "$@"
