@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =================================================================
-#  Interactive NFTABLES Firewall Manager - v7.4
+#  Interactive NFTABLES Firewall Manager - v7.5
 # =================================================================
 # First-run ONLY: apt update/upgrade + install deps (nftables,curl)
 # Detect & auto-allow current SSH port
@@ -79,7 +79,12 @@ canonicalize_blocklist_file(){
   ' "$BLOCKED_IPS_FILE" 2>/dev/null | sort -u > "$tmp"
   mv "$tmp" "$BLOCKED_IPS_FILE"
 }
-get_clean_blocklist(){ canonicalize_blocklist_file; cat "$BLOCKED_IPS_FILE"; }
+
+get_clean_blocklist(){
+  canonicalize_blocklist_file
+  cat "$BLOCKED_IPS_FILE"
+}
+
 create_default_blocked_ips_fallback(){
   cat > "$BLOCKED_IPS_FILE" << 'EOL'
 # Private/reserved ranges (fallback)
@@ -91,20 +96,7 @@ create_default_blocked_ips_fallback(){
 198.51.100.0/24
 203.0.113.0/24
 EOL
-  canonicalize_blocklist_file()
-}
-# (typo guard)
-canonicalize_blocklist_file(){ :; } # will be redefined above; no-op if heredoc got mangled
-
-# redefine properly (safe)
-canonicalize_blocklist_file(){
-  local tmp; tmp=$(mktemp)
-  awk '
-    { gsub(/\r/,"") }
-    /^[[:space:]]*#/ { next }
-    { gsub(/^[[:space:]]+|[[:space:]]+$/,""); if (length($0)) print $0 }
-  ' "$BLOCKED_IPS_FILE" 2>/dev/null | sort -u > "$tmp"
-  mv "$tmp" "$BLOCKED_IPS_FILE"
+  canonicalize_blocklist_file
 }
 
 update_blocklist(){
@@ -128,6 +120,7 @@ update_blocklist(){
   rm -f "$tmp" || true
   return 1
 }
+
 ensure_blocklist_populated(){
   ensure_config_dir
   canonicalize_blocklist_file
@@ -260,6 +253,7 @@ valid_ipv4_cidr(){
   if [[ -n "$mask" ]]; then [[ "$mask" =~ ^[0-9]+$ ]] && ((mask>=0 && mask<=32)) || return 1; fi
   return 0
 }
+
 parse_and_process_ips(){
   local action="$1" input_items="$2"
   local -i count=0
@@ -414,26 +408,19 @@ uninstall_script(){
 }
 
 initial_setup(){
-  if [ ! -d "$CONFIG_DIR" ]; then
-    echo -e "${YELLOW}First-time setup: creating configuration...${NC}"
-    ensure_config_dir
-    local ssh_port; ssh_port=$(detect_ssh_port)
-    echo -e "${GREEN}Detected SSH on ${ssh_port}/tcp; it will be allowed automatically.${NC}"
-    ensure_ssh_in_config
-    ensure_blocklist_populated
-    echo -e "\n${GREEN}Initial configuration complete.${NC}"
-    echo "Select 'Apply Firewall Rules' to activate."
-    press_enter_to_continue
-  else
-    ensure_ssh_in_config
-  fi
+  # If config dir already exists (after prepare_system), we still ensure SSH port present
+  ensure_config_dir
+  local ssh_port; ssh_port=$(detect_ssh_port)
+  echo -e "${GREEN}Detected SSH on ${ssh_port}/tcp; it will be allowed automatically.${NC}"
+  ensure_ssh_in_config
+  ensure_blocklist_populated
 }
 
 main_menu(){
   while true; do
     clear
     echo "==============================="
-    echo " NFTABLES FIREWALL MANAGER v7.4"
+    echo " NFTABLES FIREWALL MANAGER v7.5"
     echo "==============================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
