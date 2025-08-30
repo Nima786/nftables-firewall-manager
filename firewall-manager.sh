@@ -2,14 +2,15 @@
 set -euo pipefail
 
 # =================================================================
-#  Interactive NFTABLES Firewall Manager - v6.7
+#  Interactive NFTABLES Firewall Manager - v6.8
 # =================================================================
 # - First run ONLY: apt update/upgrade + install deps (nftables, curl)
-# - Subsequent runs: NO apt/network checks and NO package installs
+# - Subsequent runs: NO apt checks and NO package installs
 # - Detects & auto-allows current SSH port
+# - Manage TCP/UDP allowed ports (auto-apply; returns to submenu)
+# - Manage Blocked IPs (IPv4 or CIDR add/remove; auto-apply)
 # - Overlap-safe blocklist (per-rule drops; no interval sets)
 # - Clean table reload: delete-if-exists, then create fresh
-# - TCP/UDP submenus: stay open; changes auto-apply (no prompt)
 # - Forward chain: only ip saddr drops (cleaner output)
 #
 # Menu:
@@ -17,10 +18,11 @@ set -euo pipefail
 #   2) Apply now
 #   3) Manage TCP
 #   4) Manage UDP
-#   5) Update blocklist
-#   6) Flush rules & reset config
-#   7) Uninstall firewall & script  ← (back, before Exit)
-#   8) Exit
+#   5) Manage Blocked IPs  ← NEW
+#   6) Update blocklist from source
+#   7) Flush rules & reset config
+#   8) Uninstall firewall & script
+#   9) Exit
 
 # --- CONFIG ---
 CONFIG_DIR="/etc/firewall_manager_nft"
@@ -34,8 +36,7 @@ FIRST_RUN_STATE="$CONFIG_DIR/.system_prep_done"   # set only by prepare_system()
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 
 press_enter_to_continue(){ echo ""; read -r -p "Press Enter to return..." < /dev/tty; }
-ensure_config_dir(){
-  mkdir -p "$CONFIG_DIR"
+ensure_config_dir(){ mkdir -p "$CONFIG_DIR"
   [ -f "$ALLOWED_TCP_PORTS_FILE" ] || touch "$ALLOWED_TCP_PORTS_FILE"
   [ -f "$ALLOWED_UDP_PORTS_FILE" ] || touch "$ALLOWED_UDP_PORTS_FILE"
   [ -f "$BLOCKED_IPS_FILE" ]      || touch "$BLOCKED_IPS_FILE"
@@ -260,47 +261,128 @@ parse_and_process_ports(){
   printf '%s\n' "$count"
 }
 
-add_ports_interactive(){
-  local proto="$1" no_prompt=${2:-""}
-  local proto_file; [[ "$proto" == "TCP" ]] && proto_file="$ALLOWED_TCP_PORTS_FILE" || proto_file="$ALLOWED_UDP_PORTS_FILE"
-  if [[ "$no_prompt" != "--no-prompt" ]]; then
-    while true; do
-      clear; echo -e "${YELLOW}--- Add Allowed ${proto} Ports ---${NC}"
-      echo "Current ${proto} ports: $(sort -n "$proto_file" 2>/dev/null | paste -s -d, || echo "None")"
-      read -r -p "Enter ${proto} port(s) to add (e.g., 80,443 or 1000-2000) or leave empty to go back: " input_ports < /dev/tty
-      [[ -z "$input_ports" ]] && break
-      local changed; changed=$(parse_and_process_ports "add" "$proto_file" "$input_ports")
-      if (( changed > 0 )); then
-        echo -e "${YELLOW}Applying firewall...${NC}"
-        apply_rules --no-pause
-      else
-        echo "No changes."
-      fi
-      press_enter_to_continue
-    done
-  fi
+# ---- IPv4 / CIDR validation (simple, no external deps) ----
+valid_ipv4_cidr(){
+  local s="$1" ip mask
+  ip=${s%%/*}; mask=${s#*/}
+  [[ "$s" == "$ip" ]] && mask=""
+  IFS='.' read -r a b c d <<<"$ip" || return 1
+  for o in "$a" "$b" "$c" "$d"; do [[ "$o" =~ ^[0-9]+$ ]] && ((o>=0 && o<=255)) || return 1; done
+  if [[ -n "$mask" ]]; then [[ "$mask" =~ ^[0-9]+$ ]] && ((mask>=0 && mask<=32)) || return 1; fi
+  return 0
 }
 
-remove_ports_interactive(){
-  local proto="$1"
-  local proto_file; [[ "$proto" == "TCP" ]] && proto_file="$ALLOWED_TCP_PORTS_FILE" || proto_file="$ALLOWED_UDP_PORTS_FILE"
-  while true; do
-    clear; echo -e "${YELLOW}--- Remove Allowed ${proto} Ports ---${NC}"
-    echo "Current ${proto} ports: $(sort -n "$proto_file" 2>/dev/null | paste -s -d, || echo "None")"
-    read -r -p "Enter ${proto} port(s) to remove (blank to go back): " input_ports < /dev/tty
-    [[ -z "$input_ports" ]] && break
-    local changed; changed=$(parse_and_process_ports "remove" "$proto_file" "$input_ports")
-    if (( changed > 0 )); then
-      echo -e "${YELLOW}Applying firewall...${NC}"
-      apply_rules --no-pause
-    else
-      echo "No changes."
+parse_and_process_ips(){
+  local action="$1" input_items="$2"
+  local -i count=0
+  IFS=',' read -ra items <<< "$input_items"
+  for raw in "${items[@]}"; do
+    local item; item=$(echo "$raw" | xargs)
+    [[ -z "$item" ]] && continue
+    if ! valid_ipv4_cidr "$item"; then
+      echo -e " -> ${RED}Invalid IPv4/CIDR: $item${NC}" >&2
+      continue
     fi
-    press_enter_to_continue
+    if [[ "$action" == "add" ]]; then
+      if ! grep -qxF "$item" "$BLOCKED_IPS_FILE"; then
+        echo "$item" >> "$BLOCKED_IPS_FILE"; ((count++))
+        echo -e " -> ${GREEN}$item added to blocklist.${NC}" >&2
+      else
+        echo -e " -> ${YELLOW}$item already present.${NC}" >&2
+      fi
+    else
+      if grep -qxF "$item" "$BLOCKED_IPS_FILE"; then
+        # escape / in sed delimiter
+        local esc="${item//\//\\/}"
+        sed -i "\#^${esc}$#d" "$BLOCKED_IPS_FILE"; ((count++))
+        echo -e " -> ${GREEN}$item removed from blocklist.${NC}" >&2
+      else
+        echo -e " -> ${YELLOW}$item not found.${NC}" >&2
+      fi
+    fi
+  done
+  printf '%s\n' "$count"
+}
+
+# ---- Single-step port interactions (return to submenu) ----
+add_ports_interactive(){
+  local proto="$1" ; local proto_file
+  [[ "$proto" == "TCP" ]] && proto_file="$ALLOWED_TCP_PORTS_FILE" || proto_file="$ALLOWED_UDP_PORTS_FILE"
+  clear; echo -e "${YELLOW}--- Add Allowed ${proto} Ports ---${NC}"
+  echo "Current ${proto} ports: $(sort -n "$proto_file" 2>/dev/null | paste -s -d, || echo "None")"
+  read -r -p "Enter ${proto} port(s) to add (e.g., 80,443 or 1000-2000): " input_ports < /dev/tty
+  [[ -z "$input_ports" ]] && return 0
+  local changed; changed=$(parse_and_process_ports "add" "$proto_file" "$input_ports")
+  if (( changed > 0 )); then echo -e "${YELLOW}Applying firewall...${NC}"; apply_rules --no-pause; else echo "No changes."; fi
+  press_enter_to_continue
+}
+remove_ports_interactive(){
+  local proto="$1" ; local proto_file
+  [[ "$proto" == "TCP" ]] && proto_file="$ALLOWED_TCP_PORTS_FILE" || proto_file="$ALLOWED_UDP_PORTS_FILE"
+  clear; echo -e "${YELLOW}--- Remove Allowed ${proto} Ports ---${NC}"
+  echo "Current ${proto} ports: $(sort -n "$proto_file" 2>/dev/null | paste -s -d, || echo "None")"
+  read -r -p "Enter ${proto} port(s) to remove: " input_ports < /dev/tty
+  [[ -z "$input_ports" ]] && return 0
+  local changed; changed=$(parse_and_process_ports "remove" "$proto_file" "$input_ports")
+  if (( changed > 0 )); then echo -e "${YELLOW}Applying firewall...${NC}"; apply_rules --no-pause; else echo "No changes."; fi
+  press_enter_to_continue
+}
+
+# ---- Blocked IPs submenu ----
+manage_ips_menu(){
+  while true; do
+    clear; echo "--- Manage Blocked IPs ---"
+    echo "Currently blocked (first 20):"
+    head -n 20 "$BLOCKED_IPS_FILE" 2>/dev/null | sed 's/^/  - /' || true
+    echo
+    echo "1) Add IP/CIDR (comma-separated, e.g., 1.2.3.4,10.0.0.0/8)"
+    echo "2) Remove IP/CIDR"
+    echo "3) Back"
+    read -r -p "Choose an option: " choice < /dev/tty
+    case $choice in
+      1)
+        read -r -p "Enter IPs/CIDRs to ADD: " ips < /dev/tty
+        [[ -z "$ips" ]] || { changed=$(parse_and_process_ips "add" "$ips"); (( changed > 0 )) && { echo -e "${YELLOW}Applying firewall...${NC}"; apply_rules --no-pause; }; }
+        press_enter_to_continue
+        ;;
+      2)
+        read -r -p "Enter IPs/CIDRs to REMOVE: " ips < /dev/tty
+        [[ -z "$ips" ]] || { changed=$(parse_and_process_ips "remove" "$ips"); (( changed > 0 )) && { echo -e "${YELLOW}Applying firewall...${NC}"; apply_rules --no-pause; }; }
+        press_enter_to_continue
+        ;;
+      3) break ;;
+      *) echo -e "${RED}Invalid option.${NC}" && sleep 1 ;;
+    esac
   done
 }
 
 view_rules(){ clear; echo -e "${YELLOW}--- Current Active NFTABLES Ruleset ---${NC}"; nft list ruleset; press_enter_to_continue; }
+
+manage_tcp_ports_menu(){
+  while true; do clear; echo "--- Manage Allowed TCP Ports ---"
+    echo "1) Add TCP Port(s)"; echo "2) Remove TCP Port(s)"; echo "3) Back"
+    read -r -p "Choose an option: " choice < /dev/tty
+    case $choice in
+      1) add_ports_interactive "TCP" ;;
+      2) remove_ports_interactive "TCP" ;;
+      3) break ;;
+      *) echo -e "${RED}Invalid option.${NC}" && sleep 1 ;;
+    esac
+  done
+}
+
+manage_udp_ports_menu(){
+  while true; do clear; echo "--- Manage Allowed UDP Ports ---"
+    echo "1) Add UDP Port(s)"; echo "2) Remove UDP Port(s)"; echo "3) Back"
+    read -r -p "Choose an option: " choice < /dev/tty
+    case $choice in
+      1) add_ports_interactive "UDP" ;;
+      2) remove_ports_interactive "UDP" ;;
+      3) break ;;
+      *) echo -e "${RED}Invalid option.${NC}" && sleep 1 ;;
+    esac
+  done
+}
 
 flush_rules(){
   clear
@@ -339,48 +421,21 @@ uninstall_script(){
   press_enter_to_continue
 }
 
-manage_tcp_ports_menu(){
-  while true; do
-    clear; echo "--- Manage Allowed TCP Ports ---"
-    echo "1) Add TCP Port(s)"; echo "2) Remove TCP Port(s)"; echo "3) Back"
-    read -r -p "Choose an option: " choice < /dev/tty
-    case $choice in
-      1) add_ports_interactive "TCP" ;;
-      2) remove_ports_interactive "TCP" ;;
-      3) break ;;
-      *) echo -e "${RED}Invalid option.${NC}" && sleep 1 ;;
-    esac
-  done
-}
-
-manage_udp_ports_menu(){
-  while true; do
-    clear; echo "--- Manage Allowed UDP Ports ---"
-    echo "1) Add UDP Port(s)"; echo "2) Remove UDP Port(s)"; echo "3) Back"
-    read -r -p "Choose an option: " choice < /dev/tty
-    case $choice in
-      1) add_ports_interactive "UDP" ;;
-      2) remove_ports_interactive "UDP" ;;
-      3) break ;;
-      *) echo -e "${RED}Invalid option.${NC}" && sleep 1 ;;
-    esac
-  done
-}
-
 main_menu(){
   while true; do
     clear
     echo "==============================="
-    echo " NFTABLES FIREWALL MANAGER v6.7"
+    echo " NFTABLES FIREWALL MANAGER v6.8"
     echo "==============================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
     echo "3) Manage Allowed TCP Ports"
     echo "4) Manage Allowed UDP Ports"
-    echo "5) Update IP Blocklist from Source"
-    echo "6) Flush All Rules & Reset Config"
-    echo "7) Uninstall Firewall & Script"
-    echo "8) Exit"
+    echo "5) Manage Blocked IPs"
+    echo "6) Update IP Blocklist from Source"
+    echo "7) Flush All Rules & Reset Config"
+    echo "8) Uninstall Firewall & Script"
+    echo "9) Exit"
     echo "-------------------------------"
     read -r -p "Choose an option: " choice < /dev/tty
     case $choice in
@@ -388,10 +443,11 @@ main_menu(){
       2) apply_rules ;;
       3) manage_tcp_ports_menu ;;
       4) manage_udp_ports_menu ;;
-      5) update_blocklist; press_enter_to_continue ;;
-      6) flush_rules ;;
-      7) uninstall_script ;;
-      8) exit 0 ;;
+      5) manage_ips_menu ;;
+      6) update_blocklist; press_enter_to_continue ;;
+      7) flush_rules ;;
+      8) uninstall_script ;;
+      9) exit 0 ;;
       *) echo -e "${RED}Invalid option.${NC}" && sleep 1 ;;
     esac
   done
@@ -402,6 +458,6 @@ if [ "$(id -u)" -ne 0 ]; then
   echo -e "${RED}This script must be run as root. Please use sudo.${NC}" >&2
   exit 1
 fi
-prepare_system          # runs ONLY once; skipped afterwards
-initial_setup           # creates config dir if missing
+prepare_system           # runs ONLY once; skipped afterwards
+initial_setup            # creates config dir if missing
 main_menu
