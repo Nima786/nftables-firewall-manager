@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://github.com/Nima786/iptables-firewall-manager/blob/main/assets/firewall-manager-logo.webp" alt="Firewall Manager Logo" width="150"/>
 </p>
-<h1 align="center">IPTABLES Firewall Manager</h1>
+<h1 align="center">NFTABLES Firewall Manager</h1>
 <p align="center">
   A powerful, menu-driven Bash utility for managing a hardened <code>iptables</code> firewall on Debian/Ubuntu systems.
   <br />
