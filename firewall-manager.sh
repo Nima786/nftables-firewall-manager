@@ -375,17 +375,29 @@ edit_ips_ui(){
         read -r -p "Enter IPs/CIDRs to remove: " s < /dev/tty
         s="$(echo "$s" | tr ' ' ',' )"
         IFS=',' read -ra arr <<<"$s"
-        local changed=0
+
+        local changed=0 tmp x
         for x in "${arr[@]}"; do
           x="$(echo "$x" | xargs)"
           [[ -z "$x" ]] && continue
           if grep -qxF "$x" "$BL_FILE"; then
-            sed -i "/^$(printf '%s' "$x" | sed 's/[.[\*^$()+?{}/\\|]/\\&/g')\$/d" "$BL_FILE"
+            tmp="$(mktemp)"
+            # Remove exact line matches safely (no regex quoting needed)
+            grep -Fvx "$x" "$BL_FILE" > "$tmp" || true
+            mv "$tmp" "$BL_FILE"
             ((changed++))
+          else
+            echo " -> not present: $x"
           fi
         done
         canonicalize_bl
-        if ((changed>0)); then echo -e "${YEL}Applying...${NC}"; apply_rules; fi
+        if ((changed>0)); then
+          echo -e "${YEL}Applying...${NC}"
+          apply_rules
+        else
+          echo "No changes."
+          press_enter
+        fi
         ;;
       3) ${PAGER:-less} "$BL_FILE" </dev/tty || cat "$BL_FILE";;
       4) break ;;
