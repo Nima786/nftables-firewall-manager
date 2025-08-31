@@ -75,30 +75,33 @@ canonicalize_bl(){
 # We purposely handle common supersets to avoid “conflicting intervals”.
 filter_bl_for_interval(){
   canonicalize_bl
-  local have_224 have_10 have_172 have_192168 have_10064 have_169254 have_19818
-  grep -qx '224.0.0.0/4'     "$BL_FILE" && have_224=1     || have_224=0
-  grep -qx '10.0.0.0/8'      "$BL_FILE" && have_10=1      || have_10=0
-  grep -qx '172.16.0.0/12'   "$BL_FILE" && have_172=1     || have_172=0
-  grep -qx '192.168.0.0/16'  "$BL_FILE" && have_192168=1  || have_192168=0
-  grep -qx '100.64.0.0/10'   "$BL_FILE" && have_10064=1   || have_10064=0
-  grep -qx '169.254.0.0/16'  "$BL_FILE" && have_169254=1  || have_169254=0
-  grep -qx '198.18.0.0/15'   "$BL_FILE" && have_19818=1   || have_19818=0
+  local s224='224.0.0.0/4' s10='10.0.0.0/8' s172='172.16.0.0/12' s192168='192.168.0.0/16'
+  local s10064='100.64.0.0/10' s169254='169.254.0.0/16' s19818='198.18.0.0/15'
+  local h224=0 h10=0 h172=0 h192168=0 h10064=0 h169254=0 h19818=0
+  grep -qx "$s224"    "$BL_FILE" && h224=1
+  grep -qx "$s10"     "$BL_FILE" && h10=1
+  grep -qx "$s172"    "$BL_FILE" && h172=1
+  grep -qx "$s192168" "$BL_FILE" && h192168=1
+  grep -qx "$s10064"  "$BL_FILE" && h10064=1
+  grep -qx "$s169254" "$BL_FILE" && h169254=1
+  grep -qx "$s19818"  "$BL_FILE" && h19818=1
 
-  awk -v h224="$have_224" -v h10="$have_10" -v h172="$have_172" \
-      -v h192168="$have_192168" -v h10064="$have_10064" \
-      -v h169254="$have_169254" -v h19818="$have_19818" '
-    function keep(l){
-      if(h224    && l ~ /^(22[4-9]|23[0-9])\./)               return 0;   # 224-239.*
-      if(h10     && l ~ /^10\./)                               return 0;   # 10/8
-      if(h172    && l ~ /^172\.(1[6-9]|2[0-9]|3[0-1])\./)      return 0;   # 172.16-31
-      if(h192168 && l ~ /^192\.168\./)                         return 0;   # 192.168/16
-      if(h10064  && l ~ /^100\.(6[4-9]|[78][0-9]|9[01])\./)    return 0;   # 100.64-100.127
-      if(h169254 && l ~ /^169\.254\./)                         return 0;   # 169.254/16
-      if(h19818  && l ~ /^198\.(18|19)\./)                     return 0;   # 198.18/15
-      return 1
+  awk -v h224="$h224" -v h10="$h10" -v h172="$h172" -v h192168="$h192168" \
+      -v h10064="$h10064" -v h169254="$h169254" -v h19818="$h19818" \
+      -v s224="$s224" -v s10="$s10" -v s172="$s172" -v s192168="$s192168" \
+      -v s10064="$s10064" -v s169254="$s169254" -v s19818="$s19818" '
+    function covered(l){
+      if (h224    && l!=s224    && l ~ /^(22[4-9]|23[0-9])\./)                  return 1; # 224–239.*
+      if (h10     && l!=s10     && l ~ /^10\./)                                 return 1;
+      if (h172    && l!=s172    && l ~ /^172\.(1[6-9]|2[0-9]|3[0-1])\./)        return 1;
+      if (h192168 && l!=s192168 && l ~ /^192\.168\./)                           return 1;
+      if (h10064  && l!=s10064  && l ~ /^100\.(6[4-9]|[78][0-9]|9[01])\./)      return 1; # 100.64–100.127
+      if (h169254 && l!=s169254 && l ~ /^169\.254\./)                           return 1;
+      if (h19818  && l!=s19818  && l ~ /^198\.(18|19)\./)                       return 1; # 198.18/15 covers 198.18–198.19
+      return 0
     }
-    /^[[:space:]]*#/ { next }
-    NF { if (keep($0)) print $0 }
+    /^[[:space:]]*#/ {next}
+    NF { if (!covered($0)) print $0 }
   ' "$BL_FILE" | sort -u
 }
 
