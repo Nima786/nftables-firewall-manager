@@ -176,7 +176,9 @@ apply_rules(){
   blocked_csv=$(join_file_csv "$BL_FILE")
 
   # nuke table if it exists, then build fresh config in one shot
-  nft list table inet "$TABLE" >/dev/null 2>&1 && nft delete table inet "$TABLE" || true
+ if nft list table inet "$TABLE" >/dev/null 2>&1; then
+  nft delete table inet "$TABLE"
+fi
 
   local tmp; tmp=$(mktemp)
   {
@@ -239,7 +241,7 @@ valid_port(){ [[ "$1" =~ ^[0-9]+$ ]] && (( $1>=1 && $1<=65535 )); }
 
 process_ports(){
   # $1 add|remove  $2 TCP|UDP  $3 raw_input
-  local action="$1" proto="$2" raw="$3" file count=0 cur ssh_port
+  local action="$1" proto="$2" raw="$3" file count=0 ssh_port
   [[ "$proto" == "TCP" ]] && file="$TCP_FILE" || file="$UDP_FILE"
   ssh_port=$(detect_ssh_port)
 
