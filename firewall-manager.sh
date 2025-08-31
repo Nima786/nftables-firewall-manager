@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =================================================================
-#  Interactive NFTABLES Firewall Manager - v8.1 (Final)
+#  Interactive NFTABLES Firewall Manager - v8.2 (Final)
 # =================================================================
 # - First-run ONLY: apt update/upgrade + install deps (nftables, curl)
 # - Detect & auto-allow current SSH port
@@ -12,10 +12,12 @@ set -euo pipefail
 # - Docker-aware FORWARD rules (bridged networking works)
 # - Clean table reload: delete-if-exists, then create fresh
 #
+# - CHANGE v8.2:
+#   - Split blocklist into two sets (one for single IPs, one for
+#     CIDR ranges) to resolve 'prefix elements' vs 'conflicting
+#     intervals' errors. This is the definitive fix.
 # - CHANGE v8.1:
-#   - Removed 'flags interval' from the nftables set definition
-#     to prevent 'conflicting intervals' error with overlapping IPs
-#     in external blocklists.
+#   - Removed 'flags interval' from the nftables set definition.
 # - CHANGE v8.0:
 #   - Replaced inefficient per-IP block rules with a highly
 #     performant nftables "set" for fast lookups.
@@ -161,8 +163,19 @@ apply_rules(){
   udp_ports=$({ sort -un "$ALLOWED_UDP_PORTS_FILE"  2>/dev/null || true; } | tr '\n' ',' | sed 's/,$//')
 
   declare -a BLOCKED_CLEAN=() DOCKER_IFACES=()
+  declare -a BLOCKED_IPS_SINGLE=() BLOCKED_IPS_CIDR=()
+
   mapfile -t BLOCKED_CLEAN < <(get_clean_blocklist) || true
   mapfile -t DOCKER_IFACES  < <(get_docker_ifaces)   || true
+
+  # Separate single IPs and CIDR ranges
+  for item in "${BLOCKED_CLEAN[@]}"; do
+    if [[ "$item" == */* ]]; then
+      BLOCKED_IPS_CIDR+=("$item")
+    else
+      BLOCKED_IPS_SINGLE+=("$item")
+    fi
+  done
 
   nft list table inet firewall-manager >/dev/null 2>&1 && nft delete table inet firewall-manager
 
@@ -171,14 +184,20 @@ apply_rules(){
     cat <<EOF
 table inet firewall-manager {
 EOF
-    # Define the high-performance set for blocked IPs
-    if ((${#BLOCKED_CLEAN[@]})); then
-      printf '  set blocked_ips {\n'
+    # Define set for single IPs
+    if ((${#BLOCKED_IPS_SINGLE[@]})); then
+      printf '  set blocked_ips_single {\n'
       printf '    type ipv4_addr\n'
-      # The following line was removed to fix the "conflicting intervals" error
-      # printf '    flags interval\n'
-      # Format the bash array into a comma-separated list for the set
-      printf '    elements = { %s }\n' "$(IFS=','; echo "${BLOCKED_CLEAN[*]}")"
+      printf '    elements = { %s }\n' "$(IFS=','; echo "${BLOCKED_IPS_SINGLE[*]}")"
+      printf '  }\n'
+    fi
+
+    # Define set for CIDR ranges
+    if ((${#BLOCKED_IPS_CIDR[@]})); then
+      printf '  set blocked_ips_cidr {\n'
+      printf '    type ipv4_addr\n'
+      printf '    flags interval\n'
+      printf '    elements = { %s }\n' "$(IFS=','; echo "${BLOCKED_IPS_CIDR[*]}")"
       printf '  }\n'
     fi
 
@@ -189,10 +208,9 @@ EOF
     iif lo accept
     ct state invalid drop
 EOF
-    # Use the single, efficient set rule instead of a loop
-    if ((${#BLOCKED_CLEAN[@]})); then
-      printf '    ip saddr @blocked_ips drop\n'
-    fi
+    # Add rules for both sets if they exist
+    ((${#BLOCKED_IPS_SINGLE[@]})) && printf '    ip saddr @blocked_ips_single drop\n'
+    ((${#BLOCKED_IPS_CIDR[@]}))   && printf '    ip saddr @blocked_ips_cidr drop\n'
 
     printf '    tcp dport %s accept\n' "$ssh_port"
     [[ -n "$tcp_ports" ]] && printf '    tcp dport { %s } accept\n' "$tcp_ports"
@@ -205,10 +223,9 @@ EOF
     ct state { established, related } accept
     ct state invalid drop
 EOF
-    # Use the single, efficient set rule instead of a loop
-    if ((${#BLOCKED_CLEAN[@]})); then
-      printf '    ip daddr @blocked_ips drop\n'
-    fi
+    # Add rules for both sets if they exist
+    ((${#BLOCKED_IPS_SINGLE[@]})) && printf '    ip daddr @blocked_ips_single drop\n'
+    ((${#BLOCKED_IPS_CIDR[@]}))   && printf '    ip daddr @blocked_ips_cidr drop\n'
 
     # Docker bridges permitted (both directions)
     if ((${#DOCKER_IFACES[@]})); then
@@ -223,10 +240,9 @@ EOF
   chain output {
     type filter hook output priority 0; policy accept;
 EOF
-    # Use the single, efficient set rule instead of a loop
-    if ((${#BLOCKED_CLEAN[@]})); then
-      printf '    ip daddr @blocked_ips drop\n'
-    fi
+    # Add rules for both sets if they exist
+    ((${#BLOCKED_IPS_SINGLE[@]})) && printf '    ip daddr @blocked_ips_single drop\n'
+    ((${#BLOCKED_IPS_CIDR[@]}))   && printf '    ip daddr @blocked_ips_cidr drop\n'
 
     cat <<'EOF'
   }
@@ -473,7 +489,7 @@ main_menu(){
   while true; do
     clear
     echo "=================================="
-    echo " NFTABLES FIREWALL MANAGER v8.1"
+    echo " NFTABLES FIREWALL MANAGER v8.2"
     echo "=================================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
