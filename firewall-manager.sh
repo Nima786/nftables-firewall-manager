@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =================================================================
-#  Interactive NFTABLES Firewall Manager - v7.8
+#  Interactive NFTABLES Firewall Manager - v7.8 (Fixed)
 # =================================================================
 # - First-run ONLY: apt update/upgrade + install deps (nftables, curl)
 # - Detect & auto-allow current SSH port
@@ -32,7 +32,7 @@ ensure_config_dir(){
   mkdir -p "$CONFIG_DIR"
   [ -f "$ALLOWED_TCP_PORTS_FILE" ] || : >"$ALLOWED_TCP_PORTS_FILE"
   [ -f "$ALLOWED_UDP_PORTS_FILE" ] || : >"$ALLOWED_UDP_PORTS_FILE"
-  [ -f "$BLOCKED_IPS_FILE" ]      || : >"$BLOCKED_IPS_FILE"
+  [ -f "$BLOCKED_IPS_FILE" ]       || : >"$BLOCKED_IPS_FILE"
 }
 
 # ---------------- First-run ONLY: system prep & deps ----------------
@@ -117,7 +117,7 @@ update_blocklist(){
   fi
   echo -e "${RED}Blocklist download failed or too small. Keeping existing.${NC}"
   rm -f "$tmp" || true
-  return 0   # never break the main menu
+  return 0  # never break the main menu
 }
 
 ensure_blocklist_populated(){
@@ -132,8 +132,8 @@ ensure_blocklist_populated(){
 # ---------------- Docker detection ----------------
 get_docker_ifaces(){
   ip -o link show 2>/dev/null \
-   | awk -F': ' '{print $2}' \
-   | awk '/^(docker0|br-)/{print $1}'
+    | awk -F': ' '{print $2}' \
+    | awk '/^(docker0|br-)/{print $1}'
 }
 
 # ---------------- Apply nft rules ----------------
@@ -178,7 +178,10 @@ EOF
     cat <<'EOF'
   }
   chain forward {
-    type filter hook forward priority 0; policy drop;
+EOF
+    # --- FIX APPLIED ON THE LINE BELOW: changed 'drop' to 'accept' ---
+    echo "    type filter hook forward priority 0; policy accept;"
+    cat <<'EOF'
     ct state { established, related } accept
     ct state invalid drop
 EOF
