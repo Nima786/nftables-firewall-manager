@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =================================================================
-#  Interactive NFTABLES Firewall Manager - v8.2
+#  Interactive NFTABLES Firewall Manager - v8.3
 # =================================================================
 # - First-run ONLY: apt update/upgrade + install deps (nftables, curl)
 # - Detect & auto-allow current SSH port
@@ -10,7 +10,7 @@ set -euo pipefail
 # - Docker-aware FORWARD rules
 # - Netscan protection: drop blocked DEST at top of FORWARD
 # - Allow ICMP (ping + PMTU)
-# - Output drops only a few reserved ranges (can disable)
+# - Robust blocklist: interval set with overlap filtering
 # =================================================================
 
 # --- CONFIG ---
@@ -94,7 +94,7 @@ EOL
 }
 
 update_blocklist(){
-  local is_initial="${1:-false}"  # used for logging (SC2034 prevention)
+  local is_initial="${1:-false}"
   if [[ "$is_initial" == true ]]; then
     echo -e "${YELLOW}Downloading latest blocklist (initial setup)...${NC}"
   else
@@ -131,6 +131,41 @@ get_docker_ifaces(){
   ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | awk '/^(docker0|br-)/{print $1}'
 }
 
+# ---- Filter out overlapping CIDRs (keep broader prefixes) ----
+# Input: lines of a.b.c.d/n on stdin
+# Output: non-overlapping CIDRs on stdout
+filter_blocklist_nonoverlap() {
+  awk '
+  function pow2(x) { return 2^x }
+  function ip2int(a,b,c,d) { return (((a*256)+b)*256+c)*256+d }
+  function parse(line,   ip,mask,n,a,b,c,d,size,start,end) {
+    split(line, ipmask, "/"); ip=ipmask[1]; n=ipmask[2]
+    split(ip, oct, "."); a=oct[1]; b=oct[2]; c=oct[3]; d=oct[4]
+    if (n == "") n=32
+    size = pow2(32-n)
+    start = int(ip2int(a,b,c,d)/size)*size
+    end   = start + size - 1
+    return start " " end " " n " " line
+  }
+  /^[[:space:]]*$/ { next }
+  {
+    print parse($0)
+  }' \
+  | sort -k1,1n -k3,3n \
+  | awk '
+    # keep an accepted list; skip a candidate if fully contained in any accepted interval
+    {
+      s=$1; e=$2; cidr=$4
+      contained=0
+      for (i=1;i<=cnt;i++){
+        if (s>=S[i] && e<=E[i]) { contained=1; break }
+      }
+      if(!contained){ cnt++; S[cnt]=s; E[cnt]=e; C[cnt]=cidr }
+    }
+    END { for(i=1;i<=cnt;i++) print C[i] }
+  '
+}
+
 apply_rules(){
   local no_pause=false; [[ "${1:-}" == "--no-pause" ]] && no_pause=true
   [[ "$no_pause" == false ]] && clear
@@ -146,11 +181,12 @@ apply_rules(){
   tcp_ports=$({ sort -un "$ALLOWED_TCP_PORTS_FILE" 2>/dev/null | grep -v -x "${ssh_port}" || true; } | tr '\n' ',' | sed 's/,$//')
   udp_ports=$({ sort -un "$ALLOWED_UDP_PORTS_FILE"  2>/dev/null || true; } | tr '\n' ',' | sed 's/,$//')
 
-  declare -a BLOCKED_CLEAN=() DOCKER_IFACES=()
-  mapfile -t BLOCKED_CLEAN < <(get_clean_blocklist) || true
-  mapfile -t DOCKER_IFACES  < <(get_docker_ifaces)   || true
+  declare -a BLOCKED_CLEAN=() BLOCKED_FILTERED=() DOCKER_IFACES=()
+  mapfile -t BLOCKED_CLEAN   < <(get_clean_blocklist) || true
+  mapfile -t DOCKER_IFACES   < <(get_docker_ifaces)   || true
+  mapfile -t BLOCKED_FILTERED < <(printf '%s\n' "${BLOCKED_CLEAN[@]}" | filter_blocklist_nonoverlap) || true
 
-  # Keep this list non-overlapping for an interval set
+  # Reserved/disjoint list (safe interval set)
   local -a RESERVED_ONLY=(10.0.0.0/8 100.64.0.0/10 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 192.0.2.0/24 198.51.100.0/24 203.0.113.0/24 198.18.0.0/15 224.0.0.0/4 240.0.0.0/4)
 
   nft list table inet firewall-manager >/dev/null 2>&1 && nft delete table inet firewall-manager
@@ -159,17 +195,17 @@ apply_rules(){
   {
     echo "table inet firewall-manager {"
 
-    # NOTE: blocked4 without 'flags interval' so overlapping CIDRs are OK
+    # blocked4: interval set (prefixes allowed) after filtering overlaps
     echo "  set blocked4 {"
-    echo "    type ipv4_addr;"
-    if ((${#BLOCKED_CLEAN[@]})); then
-      printf "    elements = { %s }\n" "$(printf '%s, ' "${BLOCKED_CLEAN[@]}" | sed 's/, $//')"
+    echo "    type ipv4_addr; flags interval;"
+    if ((${#BLOCKED_FILTERED[@]})); then
+      printf "    elements = { %s }\n" "$(printf '%s, ' "${BLOCKED_FILTERED[@]}" | sed 's/, $//')"
     else
       echo "    elements = { }"
     fi
     echo "  }"
 
-    # Interval set is fine here because we keep it disjoint
+    # reserved4: disjoint interval set
     echo "  set reserved4 {"
     echo "    type ipv4_addr; flags interval;"
     printf "    elements = { %s }\n" "$(printf '%s, ' "${RESERVED_ONLY[@]}" | sed 's/, $//')"
@@ -428,7 +464,7 @@ main_menu(){
   while true; do
     clear
     echo "==============================="
-    echo " NFTABLES FIREWALL MANAGER v8.2"
+    echo " NFTABLES FIREWALL MANAGER v8.3"
     echo "==============================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
