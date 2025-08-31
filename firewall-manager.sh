@@ -423,7 +423,7 @@ uninstall_script(){
     systemctl restart nftables.service || true
     rm -rf "$CONFIG_DIR"
     echo -e "${GREEN}Firewall removed. The script will self-destruct.${NC}"
-    (sleep 1 && rm -f -- "$0") &; exit 0
+    (sleep 1 && rm -f -- "$0") & exit 0
   else
     echo "Operation cancelled."
   fi
