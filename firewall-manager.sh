@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =================================================================
-#  Interactive NFTABLES Firewall Manager - v8.2 (Final)
+#  Interactive NFTABLES Firewall Manager - v8.3 (Final)
 # =================================================================
 # - First-run ONLY: apt update/upgrade + install deps (nftables, curl)
 # - Detect & auto-allow current SSH port
@@ -12,10 +12,13 @@ set -euo pipefail
 # - Docker-aware FORWARD rules (bridged networking works)
 # - Clean table reload: delete-if-exists, then create fresh
 #
+# - CHANGE v8.3:
+#   - Replaced glob pattern with a more reliable regex to separate
+#     single IPs from CIDR ranges, fixing the final 'prefix' error.
 # - CHANGE v8.2:
 #   - Split blocklist into two sets (one for single IPs, one for
 #     CIDR ranges) to resolve 'prefix elements' vs 'conflicting
-#     intervals' errors. This is the definitive fix.
+#     intervals' errors.
 # - CHANGE v8.1:
 #   - Removed 'flags interval' from the nftables set definition.
 # - CHANGE v8.0:
@@ -170,7 +173,7 @@ apply_rules(){
 
   # Separate single IPs and CIDR ranges
   for item in "${BLOCKED_CLEAN[@]}"; do
-    if [[ "$item" == */* ]]; then
+    if [[ "$item" =~ "/" ]]; then
       BLOCKED_IPS_CIDR+=("$item")
     else
       BLOCKED_IPS_SINGLE+=("$item")
