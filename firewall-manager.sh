@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =================================================================
-#  NFTABLES Firewall Manager  v8.3  (compact set + port submenus)
+#  NFTABLES Firewall Manager  v8.3.1  (compact set + port submenus)
 # =================================================================
 
 # --- CONFIG ---
@@ -36,7 +36,6 @@ install_deps_once(){
 }
 
 detect_ssh_port(){
-  # Try ss first, fall back to sshd_config, default 22
   local p=""
   p=$(ss -ltn 2>/dev/null | awk '/LISTEN/ && $4 ~ /:[0-9]+$/ {sub(/.*:/,"",$4); print $4}' \
       | while read -r x; do ss -ltnp "sport = :$x" 2>/dev/null | grep -q sshd && { echo "$x"; break; }; done || true)
@@ -50,9 +49,8 @@ ensure_ssh_in_tcpfile(){
   grep -qx "$s" "$TCP_FILE" || echo "$s" >> "$TCP_FILE"
 }
 
-# ---------- Blocklist handling (compact, overlap-safe) ----------
+# ---------- Blocklist (baseline + compact, overlap-safe) ----------
 baseline_blocklist(){
-  # These are always enforced to keep scans away and avoid overlap noise
   cat <<'EOT'
 10.0.0.0/8
 172.16.0.0/12
@@ -83,16 +81,13 @@ canonicalize_bl(){
   mv "$t" "$BL_FILE"
 }
 
-# Remove entries that are subnets of our baseline big prefixes
 filter_for_interval(){
   canonicalize_bl
   local t; t=$(mktemp)
 
-  # Build awk with baseline prefixes present or not (to decide coverage)
   local bfile; bfile=$(mktemp)
   baseline_blocklist | sort -u > "$bfile"
 
-  # Prepare flags for “is present” checks
   local h224=0 h10=0 h172=0 h192168=0 h10064=0 h169254=0 h19818=0
   grep -qx "224.0.0.0/4"     "$bfile" && h224=1
   grep -qx "10.0.0.0/8"      "$bfile" && h10=1
@@ -102,10 +97,8 @@ filter_for_interval(){
   grep -qx "169.254.0.0/16"  "$bfile" && h169254=1
   grep -qx "198.18.0.0/15"   "$bfile" && h19818=1
 
-  awk -v h224="$h224" -v h10="$h10" -v h172="$h172" -v h192168="$h192168" \
-      -v h10064="$h10064" -v h169254="$h169254" -v h19818="$h19818" '
+  awk '
     BEGIN{
-      # Always emit the baseline first (guaranteed, merged later with remote)
       print "10.0.0.0/8"
       print "172.16.0.0/12"
       print "192.168.0.0/16"
@@ -122,22 +115,9 @@ filter_for_interval(){
       print "206.191.152.0/24"
       print "216.218.185.0/24"
       print "240.0.0.0/24"
-    }
-    function covered(l){
-      # filter out subnets if a baseline superset is present
-      if (h224    && l ~ /^(22[4-9]|23[0-9])\./)                         return 1;
-      if (h10     && l ~ /^10\./)                                       return 1;
-      if (h172    && l ~ /^172\.(1[6-9]|2[0-9]|3[0-1])\./)              return 1;
-      if (h192168 && l ~ /^192\.168\./)                                 return 1;
-      if (h10064  && l ~ /^100\.(6[4-9]|[78][0-9]|9[01])\./)            return 1;
-      if (h169254 && l ~ /^169\.254\./)                                 return 1;
-      if (h19818  && l ~ /^198\.(18|19)\./)                             return 1;
-      return 0
-    }
-    { next }' /dev/null > "$t"  # baseline already written
+    }' /dev/null > "$t"
 
-  # Append remote list filtered against baseline “covered”
-  awk -v OFS="\n" -v h224="$h224" -v h10="$h10" -v h172="$h172" -v h192168="$h192168" \
+  awk -v h224="$h224" -v h10="$h10" -v h172="$h172" -v h192168="$h192168" \
       -v h10064="$h10064" -v h169254="$h169254" -v h19818="$h19818" '
     function covered(l){
       if (h224    && l ~ /^(22[4-9]|23[0-9])\./)                         return 1;
@@ -174,12 +154,10 @@ update_blocklist(){
   fi
 }
 
-# ---------- Docker ----------
 docker_ifaces(){
   ip -o link show 2>/dev/null | awk -F': ' '/^(docker0|br-)/{print $2}'
 }
 
-# ---------- Apply nft rules ----------
 apply_rules(){
   clear
   echo "[+] Building new nftables ruleset..."
@@ -187,16 +165,13 @@ apply_rules(){
   ensure_dirs
   ensure_ssh_in_tcpfile
 
-  # Prepare lists
   local sshp; sshp=$(detect_ssh_port)
   local tcp_list udp_list
   tcp_list=$({ grep -E '^[0-9]+$' "$TCP_FILE" 2>/dev/null | sort -un | grep -v -x "$sshp" || true; } | paste -sd, -)
   udp_list=$({ grep -E '^[0-9]+$' "$UDP_FILE" 2>/dev/null | sort -un || true; } | paste -sd, -)
 
-  # Compact blocklist (baseline + remote filtered)
   mapfile -t BL_CLEAN < <(filter_for_interval)
 
-  # Remove old and build new
   nft list table inet firewall-manager >/dev/null 2>&1 && nft delete table inet firewall-manager
 
   local tmp; tmp=$(mktemp)
@@ -232,7 +207,6 @@ apply_rules(){
     echo "    ct state invalid drop"
     echo "    icmp type { destination-unreachable, time-exceeded, parameter-problem } accept"
     echo "    ip daddr @blocked_ips drop"
-    # allow docker bridges if present
     for d in $(docker_ifaces); do
       echo "    iifname \"$d\" accept"
       echo "    oifname \"$d\" accept"
@@ -258,12 +232,12 @@ apply_rules(){
   rm -f "$tmp"
 }
 
-# ---------- Helpers for ports/IP editing ----------
 validate_port(){ [[ "$1" =~ ^[0-9]+$ ]] && (( $1>=1 && $1<=65535 )); }
 
 edit_ports(){
   local mode="$1" file="$2"
-  local action label; label=$(basename "$file")
+  local label; label=$(basename "$file")   # (fix SC2034: no unused var)
+
   while true; do
     clear
     echo -e "${Y}--- Manage ${mode} Ports (${label}) ---${N}"
@@ -315,7 +289,11 @@ edit_ports(){
               echo " -> range $x processed."
             else echo " -> invalid range: $x"; fi
           elif validate_port "$x"; then
-            if grep -qx "$x" "$file"; then sed -i "/^${x}\$/d" "$file"; changed=1; echo " -> port $x removed."; else echo " -> not found: $x"; fi
+            if grep -qx "$x" "$file"; then
+              sed -i "/^${x}\$/d" "$file"; changed=1; echo " -> port $x removed."
+            else
+              echo " -> not found: $x"
+            fi
           else
             echo " -> invalid: $x"
           fi
@@ -374,7 +352,10 @@ manage_ips(){
         for it in "${arr[@]}"; do
           it=$(echo "$it" | xargs); [[ -z "$it" ]] && continue
           if grep -qxF "$it" "$BL_FILE"; then
-            sed -i "/^$(printf '%s' "$it" | sed 's/[.[\*^$(){}?+|/]/\\&/g')\$/d" "$BL_FILE"
+            # Use fixed-string exact-line removal (fixes SC2016)
+            local tmp; tmp=$(mktemp)
+            grep -Fvx "$it" "$BL_FILE" > "$tmp" || true
+            mv "$tmp" "$BL_FILE"
             changed=1; echo " -> removed $it"
           else
             echo " -> not found $it"
@@ -420,7 +401,7 @@ main_menu(){
   while true; do
     clear
     echo "==============================="
-    echo " NFTABLES FIREWALL MANAGER v8.3"
+    echo " NFTABLES FIREWALL MANAGER v8.3.1"
     echo "==============================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
@@ -448,7 +429,6 @@ main_menu(){
   done
 }
 
-# ---- Bootstrap ----
 [[ "$(id -u)" -eq 0 ]] || { echo -e "${R}Run as root (sudo).${N}"; exit 1; }
 install_deps_once
 ensure_dirs
