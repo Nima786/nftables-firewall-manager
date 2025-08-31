@@ -2,15 +2,16 @@
 set -euo pipefail
 
 # =================================================================
-#  Interactive NFTABLES Firewall Manager - v8.3
+#  Interactive NFTABLES Firewall Manager - v7.8
 # =================================================================
 # - First-run ONLY: apt update/upgrade + install deps (nftables, curl)
 # - Detect & auto-allow current SSH port
-# - Manage TCP/UDP ports + IP blocklist (fast set-based lookups)
-# - Docker-aware FORWARD rules
-# - Netscan protection: drop blocked DEST at top of FORWARD
-# - Allow ICMP (ping + PMTU)
-# - Robust blocklist: interval set with overlap filtering
+# - Manage TCP/UDP ports (auto-apply; stays in submenu)
+# - Manage Blocked IPs (IPv4/CIDR add/remove; auto-apply; stays in submenu)
+# - Egress protection: drop to blocked destinations in OUTPUT
+# - FORWARD: drop blocked DESTINATIONS before Docker accepts
+# - Allow ICMP echo-request (ping) so reachability tests work
+# - Clean table reload (delete-if-exists, then create fresh)
 # =================================================================
 
 # --- CONFIG ---
@@ -33,6 +34,7 @@ ensure_config_dir(){
   [ -f "$BLOCKED_IPS_FILE" ]      || : >"$BLOCKED_IPS_FILE"
 }
 
+# ---------------- First-run ONLY: system prep & deps ----------------
 prepare_system(){
   export DEBIAN_FRONTEND=noninteractive
   ensure_config_dir
@@ -50,6 +52,7 @@ prepare_system(){
   echo "Initial system preparation complete."
 }
 
+# ---------------- SSH port detection ----------------
 detect_ssh_port(){
   local port=""
   port=$(
@@ -67,6 +70,7 @@ ensure_ssh_in_config(){
   grep -qx "$ssh_port" "$ALLOWED_TCP_PORTS_FILE" || echo "$ssh_port" >> "$ALLOWED_TCP_PORTS_FILE"
 }
 
+# ---------------- Blocklist handling ----------------
 canonicalize_blocklist_file(){
   local tmp; tmp=$(mktemp)
   awk '
@@ -80,7 +84,7 @@ get_clean_blocklist(){ canonicalize_blocklist_file; cat "$BLOCKED_IPS_FILE"; }
 
 create_default_blocked_ips_fallback(){
   cat > "$BLOCKED_IPS_FILE" << 'EOL'
-# Private/reserved ranges (fallback)
+# Private/reserved + test ranges (fallback)
 10.0.0.0/8
 172.16.0.0/12
 192.168.0.0/16
@@ -89,17 +93,14 @@ create_default_blocked_ips_fallback(){
 198.51.100.0/24
 203.0.113.0/24
 198.18.0.0/15
+224.0.0.0/4
+240.0.0.0/4
 EOL
   canonicalize_blocklist_file
 }
 
 update_blocklist(){
-  local is_initial="${1:-false}"
-  if [[ "$is_initial" == true ]]; then
-    echo -e "${YELLOW}Downloading latest blocklist (initial setup)...${NC}"
-  else
-    echo -e "${YELLOW}Downloading latest blocklist...${NC}"
-  fi
+  echo -e "${YELLOW}Downloading latest blocklist...${NC}"
   local tmp; tmp=$(mktemp)
   if curl -fsSL "$BLOCKLIST_URL" -o "$tmp"; then
     if [ -s "$tmp" ] && [ "$(wc -l < "$tmp")" -gt 10 ]; then
@@ -110,6 +111,7 @@ update_blocklist(){
       ' "$tmp" | sort -u > "$BLOCKED_IPS_FILE"
       rm -f "$tmp"
       echo -e "${GREEN}Blocklist updated.${NC}"
+      prompt_to_apply
       return 0
     fi
   fi
@@ -123,49 +125,18 @@ ensure_blocklist_populated(){
   canonicalize_blocklist_file
   local count; count=$(wc -l < "$BLOCKED_IPS_FILE" 2>/dev/null || echo 0)
   if [ "${count:-0}" -eq 0 ]; then
-    update_blocklist true || create_default_blocked_ips_fallback
+    update_blocklist || create_default_blocked_ips_fallback
   fi
 }
 
+# ---------------- Docker detection ----------------
 get_docker_ifaces(){
-  ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | awk '/^(docker0|br-)/{print $1}'
+  ip -o link show 2>/dev/null \
+   | awk -F': ' '{print $2}' \
+   | awk '/^(docker0|br-)/{print $1}'
 }
 
-# ---- Filter out overlapping CIDRs (keep broader prefixes) ----
-# Input: lines of a.b.c.d/n on stdin
-# Output: non-overlapping CIDRs on stdout
-filter_blocklist_nonoverlap() {
-  awk '
-  function pow2(x) { return 2^x }
-  function ip2int(a,b,c,d) { return (((a*256)+b)*256+c)*256+d }
-  function parse(line,   ip,mask,n,a,b,c,d,size,start,end) {
-    split(line, ipmask, "/"); ip=ipmask[1]; n=ipmask[2]
-    split(ip, oct, "."); a=oct[1]; b=oct[2]; c=oct[3]; d=oct[4]
-    if (n == "") n=32
-    size = pow2(32-n)
-    start = int(ip2int(a,b,c,d)/size)*size
-    end   = start + size - 1
-    return start " " end " " n " " line
-  }
-  /^[[:space:]]*$/ { next }
-  {
-    print parse($0)
-  }' \
-  | sort -k1,1n -k3,3n \
-  | awk '
-    # keep an accepted list; skip a candidate if fully contained in any accepted interval
-    {
-      s=$1; e=$2; cidr=$4
-      contained=0
-      for (i=1;i<=cnt;i++){
-        if (s>=S[i] && e<=E[i]) { contained=1; break }
-      }
-      if(!contained){ cnt++; S[cnt]=s; E[cnt]=e; C[cnt]=cidr }
-    }
-    END { for(i=1;i<=cnt;i++) print C[i] }
-  '
-}
-
+# ---------------- Apply nft rules (no sets; simple & robust) ----------------
 apply_rules(){
   local no_pause=false; [[ "${1:-}" == "--no-pause" ]] && no_pause=true
   [[ "$no_pause" == false ]] && clear
@@ -181,70 +152,63 @@ apply_rules(){
   tcp_ports=$({ sort -un "$ALLOWED_TCP_PORTS_FILE" 2>/dev/null | grep -v -x "${ssh_port}" || true; } | tr '\n' ',' | sed 's/,$//')
   udp_ports=$({ sort -un "$ALLOWED_UDP_PORTS_FILE"  2>/dev/null || true; } | tr '\n' ',' | sed 's/,$//')
 
-  declare -a BLOCKED_CLEAN=() BLOCKED_FILTERED=() DOCKER_IFACES=()
-  mapfile -t BLOCKED_CLEAN   < <(get_clean_blocklist) || true
-  mapfile -t DOCKER_IFACES   < <(get_docker_ifaces)   || true
-  mapfile -t BLOCKED_FILTERED < <(printf '%s\n' "${BLOCKED_CLEAN[@]}" | filter_blocklist_nonoverlap) || true
-
-  # Reserved/disjoint list (safe interval set)
-  local -a RESERVED_ONLY=(10.0.0.0/8 100.64.0.0/10 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 192.0.2.0/24 198.51.100.0/24 203.0.113.0/24 198.18.0.0/15 224.0.0.0/4 240.0.0.0/4)
+  declare -a BLOCKED_CLEAN=() DOCKER_IFACES=()
+  mapfile -t BLOCKED_CLEAN < <(get_clean_blocklist) || true
+  mapfile -t DOCKER_IFACES  < <(get_docker_ifaces)   || true
 
   nft list table inet firewall-manager >/dev/null 2>&1 && nft delete table inet firewall-manager
 
   local tmp_rules; tmp_rules=$(mktemp)
   {
-    echo "table inet firewall-manager {"
-
-    # blocked4: interval set (prefixes allowed) after filtering overlaps
-    echo "  set blocked4 {"
-    echo "    type ipv4_addr; flags interval;"
-    if ((${#BLOCKED_FILTERED[@]})); then
-      printf "    elements = { %s }\n" "$(printf '%s, ' "${BLOCKED_FILTERED[@]}" | sed 's/, $//')"
-    else
-      echo "    elements = { }"
-    fi
-    echo "  }"
-
-    # reserved4: disjoint interval set
-    echo "  set reserved4 {"
-    echo "    type ipv4_addr; flags interval;"
-    printf "    elements = { %s }\n" "$(printf '%s, ' "${RESERVED_ONLY[@]}" | sed 's/, $//')"
-    echo "  }"
-
     cat <<EOF
+table inet firewall-manager {
   chain input {
     type filter hook input priority 0; policy drop;
     ct state { established, related } accept
     iif lo accept
     ct state invalid drop
-    ip protocol icmp icmp type { echo-request, echo-reply, destination-unreachable, time-exceeded, parameter-problem } accept
-    ip saddr @blocked4 drop
-    tcp dport ${ssh_port} accept
+    # Allow ping (IPv4)
+    icmp type echo-request accept
 EOF
+    if ((${#BLOCKED_CLEAN[@]})); then
+      for ip in "${BLOCKED_CLEAN[@]}"; do printf '    ip saddr %s drop\n' "$ip"; done
+    fi
+    printf '    tcp dport %s accept\n' "$ssh_port"
     [[ -n "$tcp_ports" ]] && printf '    tcp dport { %s } accept\n' "$tcp_ports"
     [[ -n "$udp_ports" ]] && printf '    udp dport { %s } accept\n' "$udp_ports"
-    echo "  }"
 
-    echo "  chain forward {"
-    echo "    type filter hook forward priority 0; policy drop;"
-    echo "    ct state { established, related } accept"
-    echo "    ct state invalid drop"
-    echo "    ip daddr @blocked4 drop"
+    cat <<'EOF'
+  }
+  chain forward {
+    type filter hook forward priority 0; policy drop;
+    ct state { established, related } accept
+    ct state invalid drop
+EOF
+    # Drop forwarded traffic to blocked destinations BEFORE Docker accepts
+    if ((${#BLOCKED_CLEAN[@]})); then
+      for ip in "${BLOCKED_CLEAN[@]}"; do printf '    ip daddr %s drop\n' "$ip"; done
+    fi
+    # Docker bridges permitted (both directions)
     if ((${#DOCKER_IFACES[@]})); then
       for ifc in "${DOCKER_IFACES[@]}"; do
         printf '    iifname "%s" accept\n' "$ifc"
         printf '    oifname "%s" accept\n' "$ifc"
       done
     fi
-    echo "    ip saddr @blocked4 drop"
-    echo "  }"
 
-    echo "  chain output {"
-    echo "    type filter hook output priority 0; policy accept;"
-    echo "    ip daddr @reserved4 drop"
-    echo "  }"
+    cat <<'EOF'
+  }
+  chain output {
+    type filter hook output priority 0; policy accept;
+EOF
+    if ((${#BLOCKED_CLEAN[@]})); then
+      for ip in "${BLOCKED_CLEAN[@]}"; do printf '    ip daddr %s drop\n' "$ip"; done
+    fi
 
-    echo "}"
+    cat <<'EOF'
+  }
+}
+EOF
   } > "$tmp_rules"
 
   if nft -f "$tmp_rules"; then
@@ -262,6 +226,7 @@ EOF
 }
 prompt_to_apply(){ apply_rules --no-pause; }
 
+# ---------------- Port helpers ----------------
 parse_and_process_ports(){
   local action="$1" proto_file="$2" input_ports="$3"
   local -i count=0
@@ -297,6 +262,7 @@ parse_and_process_ports(){
   printf '%s\n' "$count"
 }
 
+# ---------------- IP helpers ----------------
 valid_ipv4_cidr(){
   local s="$1" ip mask
   ip=${s%%/*}; mask=${s#*/}
@@ -329,6 +295,7 @@ parse_and_process_ips(){
   printf '%s\n' "$count"
 }
 
+# ---------------- Interactions ----------------
 add_ports_interactive(){ local proto="$1" ; local proto_file
   [[ "$proto" == "TCP" ]] && proto_file="$ALLOWED_TCP_PORTS_FILE" || proto_file="$ALLOWED_UDP_PORTS_FILE"
   clear; echo -e "${YELLOW}--- Add Allowed ${proto} Ports ---${NC}"
@@ -464,7 +431,7 @@ main_menu(){
   while true; do
     clear
     echo "==============================="
-    echo " NFTABLES FIREWALL MANAGER v8.3"
+    echo " NFTABLES FIREWALL MANAGER v7.8"
     echo "==============================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
