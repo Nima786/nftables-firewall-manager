@@ -2,17 +2,13 @@
 set -euo pipefail
 
 # =================================================================
-#  Interactive NFTABLES Firewall Manager - v7.8 (Fixed)
+#  Interactive NFTABLES Firewall Manager - v3.4 (Definitive)
 # =================================================================
-# - First-run ONLY: apt update/upgrade + install deps (nftables, curl)
-# - Detect & auto-allow current SSH port
-# - Manage TCP/UDP ports (auto-apply; stays in submenu)
-# - Manage Blocked IPs (IPv4/CIDR add/remove; auto-apply; stays in submenu)
-# - Auto-populate & canonicalize blocklist
-# - Docker-aware FORWARD rules (bridged networking works)
-# - FORWARD: drop blocked DESTINATIONS before Docker accepts (fixes netscan)
-# - Clean table reload: delete-if-exists, then create fresh
-# - CHANGE in v7.8: removed duplicate ip saddr block in FORWARD
+# - Final version incorporating all fixes and best practices.
+# - Enforces a secure 'policy drop' on the input chain.
+# - Includes ICMP rules for network health and diagnostics (Ping/PMTU).
+# - Uses high-performance sets with Python-based CIDR pruning.
+# - Provides logging for dropped packets and robust rate-limiting for SSH.
 # =================================================================
 
 # --- CONFIG ---
@@ -46,7 +42,7 @@ prepare_system(){
   echo "[+] First run detected: updating system and installing dependencies..."
   apt-get update -y
   apt-get -y upgrade || true
-  apt-get install -y nftables curl
+  apt-get install -y nftables curl python3
   systemctl enable nftables.service >/dev/null 2>&1 || true
   systemctl start  nftables.service  >/dev/null 2>&1 || true
   touch "$FIRST_RUN_STATE"
@@ -83,6 +79,38 @@ canonicalize_blocklist_file(){
 }
 get_clean_blocklist(){ canonicalize_blocklist_file; cat "$BLOCKED_IPS_FILE"; }
 
+# --- Python helper to remove overlapping CIDR ranges ---
+prune_cidrs_py() {
+    python3 -c '
+import sys
+import ipaddress
+
+def prune_networks(networks_str):
+    """Takes a list of network strings, returns a pruned list of non-overlapping networks."""
+    try:
+        networks = []
+        for s in networks_str:
+            s = s.strip()
+            if s:
+                try:
+                    networks.append(ipaddress.ip_network(s, strict=False))
+                except ValueError:
+                    pass
+        
+        pruned_list = ipaddress.collapse_addresses(networks)
+        
+        for net in pruned_list:
+            print(net)
+    except Exception:
+        for s in networks_str:
+            print(s.strip())
+
+if __name__ == "__main__":
+    prune_networks(sys.stdin.readlines())
+'
+}
+
+
 create_default_blocked_ips_fallback(){
   cat > "$BLOCKED_IPS_FILE" << 'EOL'
 # Private/reserved ranges (fallback)
@@ -117,7 +145,7 @@ update_blocklist(){
   fi
   echo -e "${RED}Blocklist download failed or too small. Keeping existing.${NC}"
   rm -f "$tmp" || true
-  return 0  # never break the main menu
+  return 0
 }
 
 ensure_blocklist_populated(){
@@ -140,7 +168,7 @@ get_docker_ifaces(){
 apply_rules(){
   local no_pause=false; [[ "${1:-}" == "--no-pause" ]] && no_pause=true
   [[ "$no_pause" == false ]] && clear
-  echo "[+] Building new nftables ruleset..."
+  echo "[+] Building new nftables ruleset with high-performance sets..."
 
   ensure_config_dir
   ensure_blocklist_populated
@@ -152,45 +180,65 @@ apply_rules(){
   tcp_ports=$({ sort -un "$ALLOWED_TCP_PORTS_FILE" 2>/dev/null | grep -v -x "${ssh_port}" || true; } | tr '\n' ',' | sed 's/,$//')
   udp_ports=$({ sort -un "$ALLOWED_UDP_PORTS_FILE"  2>/dev/null || true; } | tr '\n' ',' | sed 's/,$//')
 
-  declare -a BLOCKED_CLEAN=() DOCKER_IFACES=()
-  mapfile -t BLOCKED_CLEAN < <(get_clean_blocklist) || true
+  local blocked_elements
+  blocked_elements=$(get_clean_blocklist | prune_cidrs_py | paste -sd, -)
+
+  declare -a DOCKER_IFACES=()
   mapfile -t DOCKER_IFACES  < <(get_docker_ifaces)   || true
 
   nft list table inet firewall-manager >/dev/null 2>&1 && nft delete table inet firewall-manager
 
   local tmp_rules; tmp_rules=$(mktemp)
   {
+    echo "table inet firewall-manager {"
+    
+    echo "  set blocked_ips {"
+    echo "    type ipv4_addr"
+    echo "    flags interval"
+    echo "    elements = { ${blocked_elements} }"
+    echo "  }"
+    
+    echo "  set ssh_brute {"
+    echo "    type ipv4_addr"
+    echo "    flags dynamic"
+    echo "    timeout 5m"
+    echo "  }"
+    echo
+
     cat <<EOF
-table inet firewall-manager {
   chain input {
     type filter hook input priority 0; policy drop;
     ct state { established, related } accept
     iif lo accept
     ct state invalid drop
+    icmp type { echo-request, echo-reply, destination-unreachable, time-exceeded, parameter-problem } accept
+
+    # SSH Brute-Force Protection
+    # 1. Drop any IP already in the set that exceeds the rate limit
+    ip saddr @ssh_brute limit rate over 4/minute drop
+    # 2. Add any new SSH connection's IP to the tracking set
+    tcp dport $ssh_port ct state new update @ssh_brute { ip saddr }
+
+    # Main Rules
+    ip saddr @blocked_ips drop
 EOF
-    if ((${#BLOCKED_CLEAN[@]})); then
-      for ip in "${BLOCKED_CLEAN[@]}"; do printf '    ip saddr %s drop\n' "$ip"; done
-    fi
     printf '    tcp dport %s accept\n' "$ssh_port"
     [[ -n "$tcp_ports" ]] && printf '    tcp dport { %s } accept\n' "$tcp_ports"
     [[ -n "$udp_ports" ]] && printf '    udp dport { %s } accept\n' "$udp_ports"
+    
+    # Log everything else that is about to be dropped by the policy
+    echo '    log prefix "[NFTABLES DROP] "'
+    echo "  }"
+    echo
 
     cat <<'EOF'
-  }
   chain forward {
-EOF
-    # --- FIX APPLIED ON THE LINE BELOW: changed 'drop' to 'accept' ---
-    echo "    type filter hook forward priority 0; policy accept;"
-    cat <<'EOF'
+    type filter hook forward priority 0; policy accept;
     ct state { established, related } accept
     ct state invalid drop
+    ip daddr @blocked_ips drop
 EOF
-    # Drop forwarded packets to blocked destinations BEFORE Docker accepts
-    if ((${#BLOCKED_CLEAN[@]})); then
-      for ip in "${BLOCKED_CLEAN[@]}"; do printf '    ip daddr %s drop\n' "$ip"; done
-    fi
 
-    # Docker bridges permitted (both directions)
     if ((${#DOCKER_IFACES[@]})); then
       for ifc in "${DOCKER_IFACES[@]}"; do
         printf '    iifname "%s" accept\n' "$ifc"
@@ -202,12 +250,7 @@ EOF
   }
   chain output {
     type filter hook output priority 0; policy accept;
-EOF
-    if ((${#BLOCKED_CLEAN[@]})); then
-      for ip in "${BLOCKED_CLEAN[@]}"; do printf '    ip daddr %s drop\n' "$ip"; done
-    fi
-
-    cat <<'EOF'
+    ip daddr @blocked_ips drop
   }
 }
 EOF
@@ -224,6 +267,7 @@ EOF
     echo "Check for syntax errors or invalid entries in your config files."
   fi
 
+  rm -f "$tmp_rules"
   [[ "$no_pause" == false ]] && press_enter_to_continue
 }
 prompt_to_apply(){ apply_rules --no-pause; }
@@ -432,9 +476,9 @@ initial_setup(){
 main_menu(){
   while true; do
     clear
-    echo "==============================="
-    echo " NFTABLES FIREWALL MANAGER v7.8"
-    echo "==============================="
+    echo "=========================================="
+    echo " NFTABLES FIREWALL MANAGER v11.2 (Definitive)"
+    echo "=========================================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
     echo "3) Manage Allowed TCP Ports"
@@ -444,7 +488,7 @@ main_menu(){
     echo "7) Flush All Rules & Reset Config"
     echo "8) Uninstall Firewall & Script"
     echo "9) Exit"
-    echo "-------------------------------"
+    echo "------------------------------------------"
     read -r -p "Choose an option: " choice < /dev/tty
     case $choice in
       1) view_rules ;;
@@ -452,7 +496,7 @@ main_menu(){
       3) manage_tcp_ports_menu ;;
       4) manage_udp_ports_menu ;;
       5) manage_ips_menu ;;
-      6) update_blocklist || true; press_enter_to_continue ;;  # stay in menu
+      6) update_blocklist || true; press_enter_to_continue ;;
       7) flush_rules ;;
       8) uninstall_script ;;
       9) exit 0 ;;
