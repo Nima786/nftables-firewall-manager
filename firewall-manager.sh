@@ -2,17 +2,18 @@
 set -euo pipefail
 
 # =================================================================
-#  Interactive NFTABLES Firewall Manager - v7.8
+#  Interactive NFTABLES Firewall Manager - v8.0
 # =================================================================
 # - First-run ONLY: apt update/upgrade + install deps (nftables, curl)
 # - Detect & auto-allow current SSH port
 # - Manage TCP/UDP ports (auto-apply; stays in submenu)
 # - Manage Blocked IPs (IPv4/CIDR add/remove; auto-apply; stays in submenu)
-# - Auto-populate & canonicalize blocklist
+# - Blocklist via nft SETS (fast lookups, no per-CIDR rule flood)
 # - Docker-aware FORWARD rules (bridged networking works)
-# - FORWARD: drop blocked DESTINATIONS before Docker accepts (fixes netscan)
+# - Netscan protection: drop blocked DESTINATIONS at top of FORWARD
+# - INPUT allows ICMP (ping + PMTU) for usability
+# - OUTPUT: only tiny reserved ranges are dropped (or remove line entirely)
 # - Clean table reload: delete-if-exists, then create fresh
-# - CHANGE in v7.8: removed duplicate ip saddr block in FORWARD
 # =================================================================
 
 # --- CONFIG ---
@@ -111,13 +112,13 @@ update_blocklist(){
       ' "$tmp" | sort -u > "$BLOCKED_IPS_FILE"
       rm -f "$tmp"
       echo -e "${GREEN}Blocklist updated.${NC}"
-      [[ "$is_initial" == false ]] && prompt_to_apply
+      # Keep menu responsive: do not auto-apply here
       return 0
     fi
   fi
   echo -e "${RED}Blocklist download failed or too small. Keeping existing.${NC}"
   rm -f "$tmp" || true
-  return 0   # never break the main menu
+  return 0   # do not break menu
 }
 
 ensure_blocklist_populated(){
@@ -136,7 +137,7 @@ get_docker_ifaces(){
    | awk '/^(docker0|br-)/{print $1}'
 }
 
-# ---------------- Apply nft rules ----------------
+# ---------------- Apply nft rules (SET-based, fast) ----------------
 apply_rules(){
   local no_pause=false; [[ "${1:-}" == "--no-pause" ]] && no_pause=true
   [[ "$no_pause" == false ]] && clear
@@ -156,58 +157,67 @@ apply_rules(){
   mapfile -t BLOCKED_CLEAN < <(get_clean_blocklist) || true
   mapfile -t DOCKER_IFACES  < <(get_docker_ifaces)   || true
 
+  # Tiny reserved set for OUTPUT only (safe & cheap). You may remove OUTPUT filtering entirely if preferred.
+  local -a RESERVED_ONLY=(10.0.0.0/8 100.64.0.0/10 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 192.0.2.0/24 198.51.100.0/24 203.0.113.0/24 198.18.0.0/15 224.0.0.0/4 233.252.0.0/24 240.0.0.0/4)
+
   nft list table inet firewall-manager >/dev/null 2>&1 && nft delete table inet firewall-manager
 
   local tmp_rules; tmp_rules=$(mktemp)
   {
+    echo "table inet firewall-manager {"
+
+    echo "  set blocked4 {"
+    echo "    type ipv4_addr; flags interval;"
+    if ((${#BLOCKED_CLEAN[@]})); then
+      printf "    elements = { %s }\n" "$(printf '%s, ' "${BLOCKED_CLEAN[@]}" | sed 's/, $//')"
+    else
+      echo "    elements = { }"
+    fi
+    echo "  }"
+
+    echo "  set reserved4 {"
+    echo "    type ipv4_addr; flags interval;"
+    printf "    elements = { %s }\n" "$(printf '%s, ' "${RESERVED_ONLY[@]}" | sed 's/, $//')"
+    echo "  }"
+
     cat <<EOF
-table inet firewall-manager {
   chain input {
     type filter hook input priority 0; policy drop;
     ct state { established, related } accept
     iif lo accept
     ct state invalid drop
+    ip protocol icmp icmp type { echo-request, echo-reply, destination-unreachable, time-exceeded, parameter-problem } accept
+    ip saddr @blocked4 drop
+    tcp dport ${ssh_port} accept
 EOF
-    if ((${#BLOCKED_CLEAN[@]})); then
-      for ip in "${BLOCKED_CLEAN[@]}"; do printf '    ip saddr %s drop\n' "$ip"; done
-    fi
-    printf '    tcp dport %s accept\n' "$ssh_port"
     [[ -n "$tcp_ports" ]] && printf '    tcp dport { %s } accept\n' "$tcp_ports"
     [[ -n "$udp_ports" ]] && printf '    udp dport { %s } accept\n' "$udp_ports"
+    echo "  }"
 
-    cat <<'EOF'
-  }
-  chain forward {
-    type filter hook forward priority 0; policy drop;
-    ct state { established, related } accept
-    ct state invalid drop
-EOF
-    # Drop forwarded packets to blocked destinations BEFORE Docker accepts
-    if ((${#BLOCKED_CLEAN[@]})); then
-      for ip in "${BLOCKED_CLEAN[@]}"; do printf '    ip daddr %s drop\n' "$ip"; done
-    fi
-
-    # Docker bridges permitted (both directions)
+    echo "  chain forward {"
+    echo "    type filter hook forward priority 0; policy drop;"
+    echo "    ct state { established, related } accept"
+    echo "    ct state invalid drop"
+    # Prevent netscan: drop to blocked destinations FIRST
+    echo "    ip daddr @blocked4 drop"
+    # If Docker is present later, allow its bridges
     if ((${#DOCKER_IFACES[@]})); then
       for ifc in "${DOCKER_IFACES[@]}"; do
         printf '    iifname "%s" accept\n' "$ifc"
         printf '    oifname "%s" accept\n' "$ifc"
       done
     fi
+    # Optional: also deny forwarded packets from blocked sources
+    echo "    ip saddr @blocked4 drop"
+    echo "  }"
 
-    cat <<'EOF'
-  }
-  chain output {
-    type filter hook output priority 0; policy accept;
-EOF
-    if ((${#BLOCKED_CLEAN[@]})); then
-      for ip in "${BLOCKED_CLEAN[@]}"; do printf '    ip daddr %s drop\n' "$ip"; done
-    fi
+    echo "  chain output {"
+    echo "    type filter hook output priority 0; policy accept;"
+    # Keep OUTPUT light to avoid breaking xHTTP/WS/gRPC; remove next line if you want zero OUTPUT filtering:
+    echo "    ip daddr @reserved4 drop"
+    echo "  }"
 
-    cat <<'EOF'
-  }
-}
-EOF
+    echo "}"
   } > "$tmp_rules"
 
   if nft -f "$tmp_rules"; then
@@ -430,7 +440,7 @@ main_menu(){
   while true; do
     clear
     echo "==============================="
-    echo " NFTABLES FIREWALL MANAGER v7.8"
+    echo " NFTABLES FIREWALL MANAGER v8.0"
     echo "==============================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
