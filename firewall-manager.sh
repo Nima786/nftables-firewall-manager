@@ -1,315 +1,334 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 # =================================================================
-#  NFTABLES Firewall Manager  – v8.2.3
-# =================================================================
-# - First-run: install deps (nftables, curl)
-# - SSH autodetect & auto-allow
-# - Manage TCP/UDP ports
-# - Blocklist as nft set (flags interval) with overlap filtering
-# - Docker-friendly FORWARD + destination drops
-# - ICMP (ping + PMTU) allowed
+#  NFTABLES Firewall Manager  v8.3  (compact set + port submenus)
 # =================================================================
 
+# --- CONFIG ---
 CONFIG_DIR="/etc/firewall_manager_nft"
 TCP_FILE="$CONFIG_DIR/allowed_tcp_ports.conf"
 UDP_FILE="$CONFIG_DIR/allowed_udp_ports.conf"
 BL_FILE="$CONFIG_DIR/blocked_ips.conf"
-BL_URL="https://raw.githubusercontent.com/Kiya6955/Abuse-Defender/main/abuse-ips.ipv4"
-FIRST_RUN_FLAG="$CONFIG_DIR/.system_prep_done"
+BLOCKLIST_URL="https://raw.githubusercontent.com/Kiya6955/Abuse-Defender/main/abuse-ips.ipv4"
 
-GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
-press_enter(){ echo ""; read -r -p "Press Enter to return..." < /dev/tty; }
+# --- COLORS ---
+G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'; N='\033[0m'
 
-ensure_cfg(){
+press_enter(){ echo; read -r -p "Press Enter to return..." < /dev/tty; }
+
+ensure_dirs(){
   mkdir -p "$CONFIG_DIR"
-  : >"${TCP_FILE}"      || true
-  : >"${UDP_FILE}"      || true
-  : >"${BL_FILE}"       || true
+  [[ -f "$TCP_FILE" ]] || : >"$TCP_FILE"
+  [[ -f "$UDP_FILE" ]] || : >"$UDP_FILE"
+  [[ -f "$BL_FILE"  ]] || : >"$BL_FILE"
 }
 
-prepare_system(){
-  ensure_cfg
-  if [ -f "$FIRST_RUN_FLAG" ]; then
-    echo "[+] First-run prep already done."
-    return
+install_deps_once(){
+  ensure_dirs
+  if ! command -v nft >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y nftables curl
+    systemctl enable nftables >/dev/null 2>&1 || true
+    systemctl start  nftables >/dev/null 2>&1 || true
   fi
-  export DEBIAN_FRONTEND=noninteractive
-  echo "[+] Installing dependencies..."
-  apt-get update -y
-  apt-get install -y nftables curl || true
-  systemctl enable --now nftables >/dev/null 2>&1 || true
-  touch "$FIRST_RUN_FLAG"
 }
 
 detect_ssh_port(){
-  local p port=""
-  port=$(
-    ss -ltn 2>/dev/null | awk '/LISTEN/ && $4 ~ /:[0-9]+$/ { sub(/.*:/,"",$4); print $4 }' | sort -u |
-    while read -r p; do ss -ltnp "sport = :$p" 2>/dev/null | grep -q sshd && { echo "$p"; break; }; done || true
-  )
-  if [[ -z "${port:-}" ]]; then
-    port=$(grep -iE '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n1 || true)
-  fi
-  [[ "$port" =~ ^[0-9]+$ ]] && ((port>=1 && port<=65535)) || port=22
-  echo "$port"
-}
-ensure_ssh_allowed(){
-  local sshp; sshp=$(detect_ssh_port)
-  grep -qx "$sshp" "$TCP_FILE" || echo "$sshp" >> "$TCP_FILE"
+  # Try ss first, fall back to sshd_config, default 22
+  local p=""
+  p=$(ss -ltn 2>/dev/null | awk '/LISTEN/ && $4 ~ /:[0-9]+$/ {sub(/.*:/,"",$4); print $4}' \
+      | while read -r x; do ss -ltnp "sport = :$x" 2>/dev/null | grep -q sshd && { echo "$x"; break; }; done || true)
+  [[ -z "${p:-}" ]] && p=$(grep -iE '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n1 || true)
+  [[ "$p" =~ ^[0-9]+$ ]] && ((p>=1 && p<=65535)) || p=22
+  echo "$p"
 }
 
-# ---------- Blocklist handling ----------
+ensure_ssh_in_tcpfile(){
+  local s; s=$(detect_ssh_port)
+  grep -qx "$s" "$TCP_FILE" || echo "$s" >> "$TCP_FILE"
+}
+
+# ---------- Blocklist handling (compact, overlap-safe) ----------
+baseline_blocklist(){
+  # These are always enforced to keep scans away and avoid overlap noise
+  cat <<'EOT'
+10.0.0.0/8
+172.16.0.0/12
+192.168.0.0/16
+169.254.0.0/16
+100.64.0.0/10
+198.18.0.0/15
+224.0.0.0/4
+192.0.2.0/24
+198.51.100.0/24
+203.0.113.0/24
+25.0.0.0/8
+45.14.174.0/24
+195.137.167.0/24
+206.191.152.0/24
+216.218.185.0/24
+240.0.0.0/24
+EOT
+}
 
 canonicalize_bl(){
-  # strip CR, comments, blanks; unique
-  local tmp; tmp=$(mktemp)
-  sed 's/\r$//' "$BL_FILE" 2>/dev/null \
-  | awk '/^[[:space:]]*#/ {next} {gsub(/^[[:space:]]+|[[:space:]]+$/,""); if(length($0)) print $0}' \
-  | sort -u > "$tmp"
-  mv "$tmp" "$BL_FILE"
+  local t; t=$(mktemp)
+  awk '
+    { gsub(/\r/,"") }
+    /^[[:space:]]*#/ { next }
+    { gsub(/^[[:space:]]+|[[:space:]]+$/,""); if (length($0)) print $0 }
+  ' "$BL_FILE" 2>/dev/null | sort -u > "$t"
+  mv "$t" "$BL_FILE"
 }
 
-# Remove subnets that would conflict with an interval superset present.
-# We purposely handle common supersets to avoid “conflicting intervals”.
-filter_bl_for_interval(){
+# Remove entries that are subnets of our baseline big prefixes
+filter_for_interval(){
   canonicalize_bl
-  local s224='224.0.0.0/4' s10='10.0.0.0/8' s172='172.16.0.0/12' s192168='192.168.0.0/16'
-  local s10064='100.64.0.0/10' s169254='169.254.0.0/16' s19818='198.18.0.0/15'
+  local t; t=$(mktemp)
+
+  # Build awk with baseline prefixes present or not (to decide coverage)
+  local bfile; bfile=$(mktemp)
+  baseline_blocklist | sort -u > "$bfile"
+
+  # Prepare flags for “is present” checks
   local h224=0 h10=0 h172=0 h192168=0 h10064=0 h169254=0 h19818=0
-  grep -qx "$s224"    "$BL_FILE" && h224=1
-  grep -qx "$s10"     "$BL_FILE" && h10=1
-  grep -qx "$s172"    "$BL_FILE" && h172=1
-  grep -qx "$s192168" "$BL_FILE" && h192168=1
-  grep -qx "$s10064"  "$BL_FILE" && h10064=1
-  grep -qx "$s169254" "$BL_FILE" && h169254=1
-  grep -qx "$s19818"  "$BL_FILE" && h19818=1
+  grep -qx "224.0.0.0/4"     "$bfile" && h224=1
+  grep -qx "10.0.0.0/8"      "$bfile" && h10=1
+  grep -qx "172.16.0.0/12"   "$bfile" && h172=1
+  grep -qx "192.168.0.0/16"  "$bfile" && h192168=1
+  grep -qx "100.64.0.0/10"   "$bfile" && h10064=1
+  grep -qx "169.254.0.0/16"  "$bfile" && h169254=1
+  grep -qx "198.18.0.0/15"   "$bfile" && h19818=1
 
   awk -v h224="$h224" -v h10="$h10" -v h172="$h172" -v h192168="$h192168" \
-      -v h10064="$h10064" -v h169254="$h169254" -v h19818="$h19818" \
-      -v s224="$s224" -v s10="$s10" -v s172="$s172" -v s192168="$s192168" \
-      -v s10064="$s10064" -v s169254="$s169254" -v s19818="$s19818" '
+      -v h10064="$h10064" -v h169254="$h169254" -v h19818="$h19818" '
+    BEGIN{
+      # Always emit the baseline first (guaranteed, merged later with remote)
+      print "10.0.0.0/8"
+      print "172.16.0.0/12"
+      print "192.168.0.0/16"
+      print "169.254.0.0/16"
+      print "100.64.0.0/10"
+      print "198.18.0.0/15"
+      print "224.0.0.0/4"
+      print "192.0.2.0/24"
+      print "198.51.100.0/24"
+      print "203.0.113.0/24"
+      print "25.0.0.0/8"
+      print "45.14.174.0/24"
+      print "195.137.167.0/24"
+      print "206.191.152.0/24"
+      print "216.218.185.0/24"
+      print "240.0.0.0/24"
+    }
     function covered(l){
-      if (h224    && l!=s224    && l ~ /^(22[4-9]|23[0-9])\./)                  return 1; # 224–239.*
-      if (h10     && l!=s10     && l ~ /^10\./)                                 return 1;
-      if (h172    && l!=s172    && l ~ /^172\.(1[6-9]|2[0-9]|3[0-1])\./)        return 1;
-      if (h192168 && l!=s192168 && l ~ /^192\.168\./)                           return 1;
-      if (h10064  && l!=s10064  && l ~ /^100\.(6[4-9]|[78][0-9]|9[01])\./)      return 1; # 100.64–100.127
-      if (h169254 && l!=s169254 && l ~ /^169\.254\./)                           return 1;
-      if (h19818  && l!=s19818  && l ~ /^198\.(18|19)\./)                       return 1; # 198.18/15 covers 198.18–198.19
+      # filter out subnets if a baseline superset is present
+      if (h224    && l ~ /^(22[4-9]|23[0-9])\./)                         return 1;
+      if (h10     && l ~ /^10\./)                                       return 1;
+      if (h172    && l ~ /^172\.(1[6-9]|2[0-9]|3[0-1])\./)              return 1;
+      if (h192168 && l ~ /^192\.168\./)                                 return 1;
+      if (h10064  && l ~ /^100\.(6[4-9]|[78][0-9]|9[01])\./)            return 1;
+      if (h169254 && l ~ /^169\.254\./)                                 return 1;
+      if (h19818  && l ~ /^198\.(18|19)\./)                             return 1;
+      return 0
+    }
+    { next }' /dev/null > "$t"  # baseline already written
+
+  # Append remote list filtered against baseline “covered”
+  awk -v OFS="\n" -v h224="$h224" -v h10="$h10" -v h172="$h172" -v h192168="$h192168" \
+      -v h10064="$h10064" -v h169254="$h169254" -v h19818="$h19818" '
+    function covered(l){
+      if (h224    && l ~ /^(22[4-9]|23[0-9])\./)                         return 1;
+      if (h10     && l ~ /^10\./)                                       return 1;
+      if (h172    && l ~ /^172\.(1[6-9]|2[0-9]|3[0-1])\./)              return 1;
+      if (h192168 && l ~ /^192\.168\./)                                 return 1;
+      if (h10064  && l ~ /^100\.(6[4-9]|[78][0-9]|9[01])\./)            return 1;
+      if (h169254 && l ~ /^169\.254\./)                                 return 1;
+      if (h19818  && l ~ /^198\.(18|19)\./)                             return 1;
       return 0
     }
     /^[[:space:]]*#/ {next}
     NF { if (!covered($0)) print $0 }
-  ' "$BL_FILE" | sort -u
+  ' "$BL_FILE" >> "$t"
+
+  sort -u "$t"
+  rm -f "$t" "$bfile"
 }
 
-default_bl(){
-  cat > "$BL_FILE" <<'EOL'
-10.0.0.0/8
-100.64.0.0/10
-102.0.0.0/8
-103.29.38.0/24
-103.49.99.0/24
-103.58.50.0/24
-103.58.82.0/24
-114.208.187.0/24
-169.254.0.0/16
-172.16.0.0/12
-185.235.86.0/24
-185.235.87.0/24
-192.0.0.0/24
-192.0.2.0/24
-192.88.99.0/24
-192.168.0.0/16
-195.137.167.0/24
-198.18.0.0/15
-198.51.100.0/24
-203.0.113.0/24
-206.191.152.0/24
-216.218.185.0/24
-224.0.0.0/4
-240.0.0.0/24
-25.0.0.0/8
-45.14.174.0/24
-EOL
-  canonicalize_bl
-}
-
-update_bl(){
+update_blocklist(){
+  echo -e "${Y}Downloading latest blocklist...${N}"
   local tmp; tmp=$(mktemp)
-  echo -e "${YELLOW}Downloading latest blocklist...${NC}"
-  if curl -fsSL "$BL_URL" -o "$tmp"; then
-    if [ -s "$tmp" ] && [ "$(wc -l < "$tmp")" -gt 10 ]; then
-      sed -i 's/\r$//' "$tmp"
-      awk '/^[[:space:]]*#/ {next} {gsub(/^[[:space:]]+|[[:space:]]+$/,""); if(length($0)) print $0}' "$tmp" \
-        | sort -u > "$BL_FILE"
-      rm -f "$tmp"
-      echo -e "${GREEN}Blocklist updated.${NC}"
-      return 0
-    fi
-  fi
-  rm -f "$tmp" || true
-  echo -e "${RED}Blocklist download failed or looked empty; keeping current file.${NC}"
-  return 1
-}
-
-ensure_bl(){
-  ensure_cfg
-  canonicalize_bl
-  if [ "$(wc -l < "$BL_FILE" 2>/dev/null || echo 0)" -eq 0 ]; then
-    update_bl || default_bl
+  if curl -fsSL "$BLOCKLIST_URL" -o "$tmp"; then
+    awk '
+      { gsub(/\r/,"") }
+      /^[[:space:]]*#/ { next }
+      { gsub(/^[[:space:]]+|[[:space:]]+$/,""); if (length($0)) print $0 }
+    ' "$tmp" | sort -u > "$BL_FILE"
+    rm -f "$tmp"
+    echo -e "${G}Blocklist updated.${N}"
+  else
+    echo -e "${R}Could not download blocklist. Keeping existing entries.${N}"
+    rm -f "$tmp" || true
   fi
 }
 
-# ---------- Docker ifaces ----------
+# ---------- Docker ----------
 docker_ifaces(){
   ip -o link show 2>/dev/null | awk -F': ' '/^(docker0|br-)/{print $2}'
 }
 
-# ---------- Apply rules ----------
+# ---------- Apply nft rules ----------
 apply_rules(){
-  local no_pause=false; [[ "${1:-}" == "--no-pause" ]] && no_pause=true
-  [[ "$no_pause" == false ]] && clear
+  clear
+  echo "[+] Building new nftables ruleset..."
 
-  ensure_cfg
-  ensure_bl
-  ensure_ssh_allowed
+  ensure_dirs
+  ensure_ssh_in_tcpfile
 
+  # Prepare lists
   local sshp; sshp=$(detect_ssh_port)
-
-  # Read ports
   local tcp_list udp_list
-  tcp_list=$({ sort -un "$TCP_FILE" 2>/dev/null | grep -vx "$sshp" || true; } | paste -sd',' -)
-  udp_list=$({ sort -un "$UDP_FILE" 2>/dev/null || true; } | paste -sd',' -)
+  tcp_list=$({ grep -E '^[0-9]+$' "$TCP_FILE" 2>/dev/null | sort -un | grep -v -x "$sshp" || true; } | paste -sd, -)
+  udp_list=$({ grep -E '^[0-9]+$' "$UDP_FILE" 2>/dev/null | sort -un || true; } | paste -sd, -)
 
-  # Filtered blocklist for interval set
-  mapfile -t BL_CLEAN < <(filter_bl_for_interval) || true
-  mapfile -t DOCK_IFS < <(docker_ifaces) || true
+  # Compact blocklist (baseline + remote filtered)
+  mapfile -t BL_CLEAN < <(filter_for_interval)
 
-  # Nuke previous table to avoid "File exists"
-  nft delete table inet firewall-manager >/dev/null 2>&1 || true
+  # Remove old and build new
+  nft list table inet firewall-manager >/dev/null 2>&1 && nft delete table inet firewall-manager
 
-  # Compose comma list for set
-  local bl_elems=""
-  if ((${#BL_CLEAN[@]})); then
-    for x in "${BL_CLEAN[@]}"; do bl_elems+="$x, "; done
-    bl_elems="${bl_elems%, }"
-  fi
-
-  local f; f=$(mktemp)
+  local tmp; tmp=$(mktemp)
   {
     echo "table inet firewall-manager {"
-    echo "  set blocked_ips { type ipv4_addr; flags interval;"
-    [[ -n "$bl_elems" ]] && echo "    elements = { $bl_elems }"
+    echo "  set blocked_ips {"
+    echo "    type ipv4_addr"
+    echo "    flags interval"
+    echo -n "    elements = { "
+    local first=1
+    for e in "${BL_CLEAN[@]}"; do
+      [[ -z "$e" ]] && continue
+      if ((first)); then printf "%s" "$e"; first=0; else printf ", %s" "$e"; fi
+    done
+    echo " }"
     echo "  }"
+
     echo "  chain input {"
-    echo "    type filter hook input priority 0; policy drop;"
+    echo "    type filter hook input priority filter; policy drop;"
     echo "    ct state { established, related } accept"
-    echo "    iif lo accept"
+    echo "    iif \"lo\" accept"
     echo "    ct state invalid drop"
-    # ICMP: ping + PMTU/errors
-    echo "    icmp type { echo-request, echo-reply, destination-unreachable, time-exceeded, parameter-problem } accept"
+    echo "    icmp type { echo-reply, destination-unreachable, echo-request, time-exceeded, parameter-problem } accept"
     echo "    ip saddr @blocked_ips drop"
     echo "    tcp dport $sshp accept"
     [[ -n "$tcp_list" ]] && echo "    tcp dport { $tcp_list } accept"
     [[ -n "$udp_list" ]] && echo "    udp dport { $udp_list } accept"
     echo "  }"
+
     echo "  chain forward {"
-    echo "    type filter hook forward priority 0; policy drop;"
+    echo "    type filter hook forward priority filter; policy drop;"
     echo "    ct state { established, related } accept"
     echo "    ct state invalid drop"
     echo "    icmp type { destination-unreachable, time-exceeded, parameter-problem } accept"
     echo "    ip daddr @blocked_ips drop"
-    if ((${#DOCK_IFS[@]})); then
-      for i in "${DOCK_IFS[@]}"; do
-        echo "    iifname \"$i\" accept"
-        echo "    oifname \"$i\" accept"
-      done
-    fi
+    # allow docker bridges if present
+    for d in $(docker_ifaces); do
+      echo "    iifname \"$d\" accept"
+      echo "    oifname \"$d\" accept"
+    done
     echo "  }"
+
     echo "  chain output {"
-    echo "    type filter hook output priority 0; policy accept;"
+    echo "    type filter hook output priority filter; policy accept;"
     echo "    ip daddr @blocked_ips drop"
     echo "  }"
     echo "}"
-  } > "$f"
+  } > "$tmp"
 
-  echo "[+] Building new nftables ruleset..."
-  if nft -f "$f"; then
-    echo -e "${GREEN}Applied.${NC}"
-    echo -e "${YELLOW}Saving to /etc/nftables.conf ...${NC}"
+  if nft -f "$tmp"; then
+    echo -e "Applied."
+    echo -e "Saving to /etc/nftables.conf ..."
     nft list ruleset > /etc/nftables.conf
     systemctl restart nftables >/dev/null 2>&1 || true
-    echo -e "${GREEN}Persisted.${NC}"
+    echo -e "${G}Persisted.${N}"
   else
-    echo -e "${RED}FATAL: Failed to apply nftables ruleset!${NC}"
-    echo "Check for syntax errors or invalid entries."
+    echo -e "${R}FATAL: Failed to apply nftables ruleset!${N}"
   fi
-
-  [[ "$no_pause" == false ]] && press_enter
+  rm -f "$tmp"
 }
 
-prompt_apply(){ apply_rules --no-pause; }
+# ---------- Helpers for ports/IP editing ----------
+validate_port(){ [[ "$1" =~ ^[0-9]+$ ]] && (( $1>=1 && $1<=65535 )); }
 
-# ---------- Port helpers (stdout only returns count) ----------
-parse_ports(){
-  local action="$1" file="$2" input="$3"
-  local -i cnt=0; local sshp; sshp=$(detect_ssh_port)
-  IFS=',' read -ra ITEMS <<<"$input"
-  for it in "${ITEMS[@]}"; do
-    it=$(echo "$it" | xargs)
-    [[ -z "$it" ]] && continue
-    if [[ "$it" == *-* ]]; then
-      local a=${it%-*} b=${it#*-}
-      if [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ && $a -le $b ]]; then
-        for ((p=a; p<=b; p++)); do
-          if [[ "$action" == "remove" && "$file" == "$TCP_FILE" && "$p" == "$sshp" ]]; then continue; fi
-          if [[ "$action" == "add"    && ! $(grep -qx "$p" "$file"; echo $?) -eq 0 ]]; then echo "$p" >> "$file"; ((cnt++))
-          elif [[ "$action" == "remove" &&   $(grep -qx "$p" "$file"; echo $?) -eq 0 ]]; then sed -i "/^${p}\$/d" "$file"; ((cnt++)); fi
+edit_ports(){
+  local mode="$1" file="$2"
+  local action label; label=$(basename "$file")
+  while true; do
+    clear
+    echo -e "${Y}--- Manage ${mode} Ports (${label}) ---${N}"
+    echo -n "Current: "; (grep -E '^[0-9]+$' "$file" 2>/dev/null | sort -un | paste -sd, -) || echo
+    echo "1) Add port(s)"
+    echo "2) Remove port(s)"
+    echo "3) Back"
+    read -r -p "Choose: " ch < /dev/tty
+    case "$ch" in
+      1)
+        read -r -p "Enter ${mode} port(s) (e.g., 80,443 or 2000-2005): " in < /dev/tty
+        [[ -z "$in" ]] && continue
+        local changed=0
+        IFS=',' read -ra items <<< "$in"
+        for x in "${items[@]}"; do
+          x="$(echo "$x" | xargs)"
+          if [[ "$x" == *-* ]]; then
+            local a=${x%-*} b=${x#*-}
+            if validate_port "$a" && validate_port "$b" && ((a<=b)); then
+              for ((p=a; p<=b; p++)); do
+                grep -qx "$p" "$file" || { echo "$p" >> "$file"; changed=1; }
+              done
+              echo " -> range $x added."
+            else echo " -> invalid range: $x"; fi
+          elif validate_port "$x"; then
+            grep -qx "$x" "$file" || { echo "$x" >> "$file"; changed=1; echo " -> port $x added."; }
+          else
+            echo " -> invalid: $x"
+          fi
         done
-        echo -e " -> ${GREEN}Range $it processed.${NC}" >&2
-      else
-        echo -e " -> ${RED}Invalid range: $it${NC}" >&2
-      fi
-    elif [[ "$it" =~ ^[0-9]+$ ]]; then
-      if [[ "$action" == "remove" && "$file" == "$TCP_FILE" && "$it" == "$sshp" ]]; then
-        echo -e " -> ${RED}Refusing to remove SSH ($sshp).${NC}" >&2; continue
-      fi
-      if [[ "$action" == "add" && "$file" == "$TCP_FILE" && "$it" == "$sshp" ]]; then
-        echo -e " -> ${YELLOW}SSH is already auto-allowed.${NC}" >&2; continue
-      fi
-      if [[ "$action" == "add"    && ! $(grep -qx "$it" "$file"; echo $?) -eq 0 ]]; then echo "$it" >> "$file"; ((cnt++)); echo -e " -> ${GREEN}Port $it added.${NC}" >&2
-      elif [[ "$action" == "remove" &&   $(grep -qx "$it" "$file"; echo $?) -eq 0 ]]; then sed -i "/^${it}\$/d" "$file"; ((cnt++)); echo -e " -> ${GREEN}Port $it removed.${NC}" >&2
-      else echo -e " -> ${YELLOW}No change for $it.${NC}" >&2; fi
-    else
-      echo -e " -> ${RED}Invalid input: $it${NC}" >&2
-    fi
+        ((changed)) && { echo -e "${Y}Applying firewall...${N}"; update_blocklist; apply_rules; } || echo "No changes."
+        press_enter
+        ;;
+      2)
+        read -r -p "Enter ${mode} port(s) to remove: " in < /dev/tty
+        [[ -z "$in" ]] && continue
+        local changed=0
+        IFS=',' read -ra items <<< "$in"
+        for x in "${items[@]}"; do
+          x="$(echo "$x" | xargs)"
+          if [[ "$x" == *-* ]]; then
+            local a=${x%-*} b=${x#*-}
+            if validate_port "$a" && validate_port "$b" && ((a<=b)); then
+              for ((p=a; p<=b; p++)); do
+                if grep -qx "$p" "$file"; then
+                  sed -i "/^${p}\$/d" "$file"; changed=1
+                fi
+              done
+              echo " -> range $x processed."
+            else echo " -> invalid range: $x"; fi
+          elif validate_port "$x"; then
+            if grep -qx "$x" "$file"; then sed -i "/^${x}\$/d" "$file"; changed=1; echo " -> port $x removed."; else echo " -> not found: $x"; fi
+          else
+            echo " -> invalid: $x"
+          fi
+        done
+        ((changed)) && { echo -e "${Y}Applying firewall...${N}"; update_blocklist; apply_rules; } || echo "No changes."
+        press_enter
+        ;;
+      3) break ;;
+      *) echo "Invalid."; sleep 1 ;;
+    esac
   done
-  printf '%s\n' "$cnt"
 }
 
-add_ports_ui(){
-  local proto="$1" file; [[ "$proto" == "TCP" ]] && file="$TCP_FILE" || file="$UDP_FILE"
-  clear; echo -e "${YELLOW}--- Add Allowed $proto Ports ---${NC}"
-  echo "Current $proto: $(sort -n "$file" 2>/dev/null | paste -sd, - || echo none)"
-  read -r -p "Enter $proto port(s) to add (e.g., 80,443 or 1000-2000): " in < /dev/tty
-  [[ -z "$in" ]] && return 0
-  local changed; changed=$(parse_ports add "$file" "$in")
-  (( changed > 0 )) && { echo -e "${YELLOW}Applying firewall...${NC}"; apply_rules --no-pause; } || echo "No changes."
-}
-remove_ports_ui(){
-  local proto="$1" file; [[ "$proto" == "TCP" ]] && file="$TCP_FILE" || file="$UDP_FILE"
-  clear; echo -e "${YELLOW}--- Remove Allowed $proto Ports ---${NC}"
-  echo "Current $proto: $(sort -n "$file" 2>/dev/null | paste -sd, - || echo none)"
-  read -r -p "Enter $proto port(s) to remove: " in < /dev/tty
-  [[ -z "$in" ]] && return 0
-  local changed; changed=$(parse_ports remove "$file" "$in")
-  (( changed > 0 )) && { echo -e "${YELLOW}Applying firewall...${NC}"; apply_rules --no-pause; } || echo "No changes."
-}
-
-# ---------- IP list UI ----------
 valid_ipv4_cidr(){
   local s="$1" ip=${1%%/*} mask=${1#*/}
   [[ "$s" == "$ip" ]] && mask=""
@@ -318,83 +337,90 @@ valid_ipv4_cidr(){
   if [[ -n "$mask" ]]; then [[ "$mask" =~ ^[0-9]+$ ]] && ((mask>=0 && mask<=32)) || return 1; fi
   return 0
 }
-edit_ips(){
-  local action="$1" items="$2" count=0
-  items=$(echo "$items" | tr ' \n' ','); IFS=',' read -ra ARR <<<"$items"
-  canonicalize_bl
-  for raw in "${ARR[@]}"; do
-    local x; x=$(echo "$raw" | xargs); [[ -z "$x" ]] && continue
-    if ! valid_ipv4_cidr "$x"; then echo -e " -> ${RED}Invalid IPv4/CIDR: $x${NC}" >&2; continue; fi
-    if [[ "$action" == "add" ]]; then
-      grep -qxF "$x" "$BL_FILE" || { echo "$x" >> "$BL_FILE"; ((count++)); }
-    else
-      if grep -qxF "$x" "$BL_FILE"; then sed -i "/^${x//./\\.}\$/d" "$BL_FILE"; ((count++)); fi
-    fi
-  done
-  echo "$count"
-}
-ips_menu(){
+
+manage_ips(){
   while true; do
-    clear; canonicalize_bl
-    local total; total=$(wc -l < "$BL_FILE" 2>/dev/null || echo 0)
+    clear
     echo "--- Manage Blocked IPs ---"
-    echo "Total entries: $total"
+    echo "First 50 entries:"
     head -n 50 "$BL_FILE" 2>/dev/null | sed 's/^/  - /' || true
-    echo; echo "1) Add IP/CIDR"; echo "2) Remove IP/CIDR"; echo "3) Show full list"; echo "4) Back"
-    read -r -p "Choose: " c < /dev/tty
-    local ch=0
-    case "$c" in
-      1) read -r -p "Enter IPs/CIDRs to ADD: " in < /dev/tty; [[ -n "$in" ]] && ch=$(edit_ips add "$in") ;;
-      2) read -r -p "Enter IPs/CIDRs to REMOVE: " in < /dev/tty; [[ -n "$in" ]] && ch=$(edit_ips remove "$in") ;;
-      3) ${PAGER:-less} -S "$BL_FILE" </dev/tty || cat "$BL_FILE"; continue ;;
-      4) break ;;
-      *) echo -e "${RED}Invalid.${NC}"; sleep 1; continue ;;
+    echo
+    echo "1) Add IP/CIDR"
+    echo "2) Remove IP/CIDR"
+    echo "3) Back"
+    read -r -p "Choose: " ch < /dev/tty
+    case "$ch" in
+      1)
+        read -r -p "Enter IPs/CIDRs (comma/space ok): " s < /dev/tty
+        s=$(echo "$s" | tr ' ' ',' )
+        local changed=0
+        IFS=',' read -ra arr <<< "$s"
+        for it in "${arr[@]}"; do
+          it=$(echo "$it" | xargs); [[ -z "$it" ]] && continue
+          if valid_ipv4_cidr "$it"; then
+            grep -qxF "$it" "$BL_FILE" || { echo "$it" >> "$BL_FILE"; changed=1; echo " -> added $it"; }
+          else
+            echo " -> invalid $it"
+          fi
+        done
+        ((changed)) && { echo -e "${Y}Applying firewall...${N}"; apply_rules; } || echo "No changes."
+        press_enter
+        ;;
+      2)
+        read -r -p "Enter IPs/CIDRs to remove: " s < /dev/tty
+        s=$(echo "$s" | tr ' ' ',' )
+        local changed=0
+        IFS=',' read -ra arr <<< "$s"
+        for it in "${arr[@]}"; do
+          it=$(echo "$it" | xargs); [[ -z "$it" ]] && continue
+          if grep -qxF "$it" "$BL_FILE"; then
+            sed -i "/^$(printf '%s' "$it" | sed 's/[.[\*^$(){}?+|/]/\\&/g')\$/d" "$BL_FILE"
+            changed=1; echo " -> removed $it"
+          else
+            echo " -> not found $it"
+          fi
+        done
+        ((changed)) && { echo -e "${Y}Applying firewall...${N}"; apply_rules; } || echo "No changes."
+        press_enter
+        ;;
+      3) break ;;
+      *) echo "Invalid."; sleep 1 ;;
     esac
-    (( ch > 0 )) && { echo -e "${YELLOW}Applying firewall...${NC}"; apply_rules --no-pause; }
-    press_enter
   done
 }
 
-view_rules(){ clear; echo -e "${YELLOW}--- Current Active NFTABLES Ruleset ---${NC}"; nft list ruleset; press_enter; }
+view_rules(){ clear; echo -e "${Y}--- Current Active NFTABLES Ruleset ---${N}"; nft list ruleset; press_enter; }
 
 flush_all(){
   clear
-  read -r -p "This will FLUSH rules and RESET config. Continue? (y/n): " y < /dev/tty
-  [[ "$y" =~ ^[yY]$ ]] || { echo "Cancelled."; press_enter; return; }
-  nft flush ruleset
+  read -r -p "ARE YOU SURE? This will open the firewall and reset config. (y/n): " a < /dev/tty
+  [[ "$a" =~ ^[yY]$ ]] || { echo "Cancelled."; press_enter; return; }
+  nft flush ruleset || true
   echo "flush ruleset" > /etc/nftables.conf
-  systemctl restart nftables || true
+  systemctl restart nftables >/dev/null 2>&1 || true
   rm -rf "$CONFIG_DIR"
-  echo -e "${GREEN}All rules flushed and config reset.${NC}"
+  ensure_dirs
+  echo -e "${G}Flushed and reset.${N}"
   press_enter
 }
 
-uninstall(){
+uninstall_self(){
   clear
-  read -r -p "Uninstall firewall & script? (y/n): " y < /dev/tty
-  [[ "$y" =~ ^[yY]$ ]] || { echo "Cancelled."; press_enter; return; }
-  nft flush ruleset
+  read -r -p "Uninstall firewall & script? (y/n): " a < /dev/tty
+  [[ "$a" =~ ^[yY]$ ]] || { echo "Cancelled."; press_enter; return; }
+  nft flush ruleset || true
   echo "flush ruleset" > /etc/nftables.conf
-  systemctl restart nftables || true
-  systemctl disable nftables >/dev/null 2>&1 || true
+  systemctl restart nftables >/dev/null 2>&1 || true
   rm -rf "$CONFIG_DIR"
-  echo -e "${GREEN}Firewall removed. Script will self-delete.${NC}"
-  (sleep 1 && rm -f -- "$0") &
-  exit 0
+  echo -e "${G}Firewall removed. Delete this file manually if needed.${N}"
+  press_enter
 }
 
-initial_setup(){
-  ensure_cfg
-  ensure_ssh_allowed
-  ensure_bl
-  echo -e "${GREEN}Detected SSH on $(detect_ssh_port)/tcp; it will be allowed automatically.${NC}"
-}
-
-menu(){
+main_menu(){
   while true; do
     clear
     echo "==============================="
-    echo " NFTABLES FIREWALL MANAGER v8.2.3"
+    echo " NFTABLES FIREWALL MANAGER v8.3"
     echo "==============================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
@@ -406,29 +432,25 @@ menu(){
     echo "8) Uninstall Firewall & Script"
     echo "9) Exit"
     echo "-------------------------------"
-    read -r -p "Choose an option: " ch < /dev/tty
-    case "$ch" in
+    read -r -p "Choose an option: " c < /dev/tty
+    case "$c" in
       1) view_rules ;;
-      2) apply_rules ;;
-      3) add_ports_ui "TCP"; press_enter ;;
-      4) add_ports_ui "UDP"; press_enter ;;
-      5) ips_menu ;;
-      6) update_bl || true; press_enter ;;
+      2) update_blocklist; apply_rules; press_enter ;;
+      3) edit_ports "TCP" "$TCP_FILE" ;;
+      4) edit_ports "UDP" "$UDP_FILE" ;;
+      5) manage_ips ;;
+      6) update_blocklist; echo "Done."; press_enter ;;
       7) flush_all ;;
-      8) uninstall ;;
+      8) uninstall_self ;;
       9) exit 0 ;;
-      *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
+      *) echo "Invalid."; sleep 1 ;;
     esac
   done
 }
 
-main(){
-  if [ "$(id -u)" -ne 0 ]; then
-    echo -e "${RED}Run as root (sudo).${NC}" >&2
-    exit 1
-  fi
-  prepare_system
-  initial_setup
-  menu
-}
-main "$@"
+# ---- Bootstrap ----
+[[ "$(id -u)" -eq 0 ]] || { echo -e "${R}Run as root (sudo).${N}"; exit 1; }
+install_deps_once
+ensure_dirs
+ensure_ssh_in_tcpfile
+main_menu
