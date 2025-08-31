@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =================================================================
-#  Interactive NFTABLES Firewall Manager - v8.0
+#  Interactive NFTABLES Firewall Manager - v8.1
 # =================================================================
 # - First-run ONLY: apt update/upgrade + install deps (nftables, curl)
 # - Detect & auto-allow current SSH port
@@ -12,7 +12,7 @@ set -euo pipefail
 # - Docker-aware FORWARD rules (bridged networking works)
 # - Netscan protection: drop blocked DESTINATIONS at top of FORWARD
 # - INPUT allows ICMP (ping + PMTU) for usability
-# - OUTPUT: only tiny reserved ranges are dropped (or remove line entirely)
+# - OUTPUT: tiny reserved ranges only (remove line if you want none)
 # - Clean table reload: delete-if-exists, then create fresh
 # =================================================================
 
@@ -100,8 +100,14 @@ EOL
 }
 
 update_blocklist(){
-  local is_initial=${1:-false}
-  echo -e "${YELLOW}Downloading latest blocklist...${NC}"
+  # SC2034 fix: use the flag for logging so it isn’t “unused”.
+  local is_initial="${1:-false}"
+  if [[ "$is_initial" == true ]]; then
+    echo -e "${YELLOW}Downloading latest blocklist (initial setup)...${NC}"
+  else
+    echo -e "${YELLOW}Downloading latest blocklist...${NC}"
+  fi
+
   local tmp; tmp=$(mktemp)
   if curl -fsSL "$BLOCKLIST_URL" -o "$tmp"; then
     if [ -s "$tmp" ] && [ "$(wc -l < "$tmp")" -gt 10 ]; then
@@ -112,13 +118,12 @@ update_blocklist(){
       ' "$tmp" | sort -u > "$BLOCKED_IPS_FILE"
       rm -f "$tmp"
       echo -e "${GREEN}Blocklist updated.${NC}"
-      # Keep menu responsive: do not auto-apply here
       return 0
     fi
   fi
   echo -e "${RED}Blocklist download failed or too small. Keeping existing.${NC}"
   rm -f "$tmp" || true
-  return 0   # do not break menu
+  return 0
 }
 
 ensure_blocklist_populated(){
@@ -157,7 +162,6 @@ apply_rules(){
   mapfile -t BLOCKED_CLEAN < <(get_clean_blocklist) || true
   mapfile -t DOCKER_IFACES  < <(get_docker_ifaces)   || true
 
-  # Tiny reserved set for OUTPUT only (safe & cheap). You may remove OUTPUT filtering entirely if preferred.
   local -a RESERVED_ONLY=(10.0.0.0/8 100.64.0.0/10 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 192.0.2.0/24 198.51.100.0/24 203.0.113.0/24 198.18.0.0/15 224.0.0.0/4 233.252.0.0/24 240.0.0.0/4)
 
   nft list table inet firewall-manager >/dev/null 2>&1 && nft delete table inet firewall-manager
@@ -198,22 +202,18 @@ EOF
     echo "    type filter hook forward priority 0; policy drop;"
     echo "    ct state { established, related } accept"
     echo "    ct state invalid drop"
-    # Prevent netscan: drop to blocked destinations FIRST
     echo "    ip daddr @blocked4 drop"
-    # If Docker is present later, allow its bridges
     if ((${#DOCKER_IFACES[@]})); then
       for ifc in "${DOCKER_IFACES[@]}"; do
         printf '    iifname "%s" accept\n' "$ifc"
         printf '    oifname "%s" accept\n' "$ifc"
       done
     fi
-    # Optional: also deny forwarded packets from blocked sources
     echo "    ip saddr @blocked4 drop"
     echo "  }"
 
     echo "  chain output {"
     echo "    type filter hook output priority 0; policy accept;"
-    # Keep OUTPUT light to avoid breaking xHTTP/WS/gRPC; remove next line if you want zero OUTPUT filtering:
     echo "    ip daddr @reserved4 drop"
     echo "  }"
 
@@ -440,7 +440,7 @@ main_menu(){
   while true; do
     clear
     echo "==============================="
-    echo " NFTABLES FIREWALL MANAGER v8.0"
+    echo " NFTABLES FIREWALL MANAGER v8.1"
     echo "==============================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
