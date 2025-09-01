@@ -4,6 +4,7 @@
 <h1 align="center">NFTABLES Firewall Manager</h1>
 <p align="center">
   A powerful, menu-driven Bash utility for managing a hardened <code>nftables</code> firewall on Debian/Ubuntu systems.
+  <br><br>
   <a href="https://github.com/Nima786/nftables-firewall-manager/actions/workflows/main.yml"><img src="https://github.com/Nima786/nftables-firewall-manager/actions/workflows/main.yml/badge.svg" alt="ShellCheck"></a>
   <img src="https://img.shields.io/badge/version-v3.6-blue.svg" alt="Version">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
