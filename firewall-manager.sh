@@ -271,6 +271,7 @@ EOF
     fi
 
     echo -e "${GREEN}Rules saved. Other tables (Docker/UFW/system) were not touched.${NC}"
+    systemctl reload nftables.service >/dev/null 2>&1 || true
     # ==========================================================================
   else
     echo -e "\n${RED}FATAL: Failed to apply nftables ruleset!${NC}"
