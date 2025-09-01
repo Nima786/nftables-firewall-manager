@@ -7,7 +7,7 @@
   <br />
   <br />
   <a href="https://github.com/Nima786/nftables-firewall-manager/actions/workflows/main.yml"><img src="https://github.com/Nima786/nftables-firewall-manager/actions/workflows/main.yml/badge.svg" alt="ShellCheck"></a>
-  <img src="https://img.shields.io/badge/version-v3.5-blue.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-v3.6-blue.svg" alt="Version">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
 </p>
 
