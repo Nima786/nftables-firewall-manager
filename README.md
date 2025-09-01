@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://github.com/Nima786/iptables-firewall-manager/blob/main/assets/firewall-manager-logo.webp" alt="Firewall Manager Logo" width="150"/>
+  <img src="https://github.com/Nima786/nftables-firewall-manager/blob/main/assets/firewall-manager-logo.webp" alt="Firewall Manager Logo" width="150"/>
 </p>
 <h1 align="center">NFTABLES Firewall Manager</h1>
 <p align="center">
@@ -74,7 +74,7 @@ The Quick Install method does not save the script file. For permanent installati
 
  ```bash
 # Download the script and place it in your system's path
-sudo curl -fsSL https://raw.githubusercontent.com/Nima786/iptables-firewall-manager/main/firewall-manager.sh -o /usr/local/bin/firewall-manager
+sudo curl -fsSL https://raw.githubusercontent.com/Nima786/nftables-firewall-manager/main/firewall-manager.sh -o /usr/local/bin/firewall-manager
 
 # Make it executable
 sudo chmod +x /usr/local/bin/firewall-manager
