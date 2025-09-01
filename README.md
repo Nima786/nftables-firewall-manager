@@ -1,12 +1,12 @@
 <p align="center">
-  <img src="https://github.com/Nima786/nftables-firewall-manager/blob/main/assets/firewall-manager-logo.webp" alt="Firewall Manager Logo" width="150"/>
+  <img src="https://github.com/Nima786/iptables-firewall-manager/blob/main/assets/firewall-manager-logo.webp" alt="Firewall Manager Logo" width="150"/>
 </p>
 <h1 align="center">NFTABLES Firewall Manager</h1>
 <p align="center">
   A powerful, menu-driven Bash utility for managing a hardened <code>iptables</code> firewall on Debian/Ubuntu systems.
   <br />
   <br />
-  <a href="https://github.com/Nima786/iptables-firewall-manager/actions/workflows/main.yml"><img src="https://github.com/Nima786/iptables-firewall-manager/actions/workflows/main.yml/badge.svg" alt="ShellCheck"></a>
+  <a href="https://github.com/Nima786/nftables-firewall-manager/actions/workflows/main.yml"><img src="https://github.com/Nima786/iptables-firewall-manager/actions/workflows/main.yml/badge.svg" alt="ShellCheck"></a>
   <img src="https://img.shields.io/badge/version-v3.5-blue.svg" alt="Version">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
 </p>
@@ -16,14 +16,14 @@
 ## Quick Install
 
  ```bash
-curl -fsSL https://raw.githubusercontent.com/Nima786/iptables-firewall-manager/main/firewall-manager.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/Nima786/nftables-firewall-manager/main/firewall-manager.sh | sudo bash
  ````
 
 This script turns complex firewall management into a simple, interactive workflow. It’s robust, safe, and **Docker-aware** so container traffic is filtered correctly instead of bypassing your rules (a common issue with UFW).
 
 
 <p align="center">
-  <img src="https://github.com/Nima786/iptables-firewall-manager/blob/main/assets/firewall-manager.webp" width="600"/>
+  <img src="https://github.com/Nima786/nftables-firewall-manager/blob/main/assets/firewall-manager.webp" width="600"/>
 </p>
 
 ## Why Use This Script?
@@ -43,7 +43,7 @@ Managing iptables can be complex, especially on servers running Docker, which of
 - 🌐 **Dynamic blocklist** – fetch and apply an IPv4 abuse list.
 - ⚙️ **Multi-port & ranges** – e.g. `80,443` or `1000-2000`.
 - 🧑‍💻 **Interactive menus** – view/apply rules, manage TCP/UDP ports & IP blocklist.
-- 📦 **Auto-deps** – installs `iptables-persistent`, `curl` if missing.
+- 📦 **Auto-deps** – installs `nftables-persistent`, `curl` if missing.
 - 🧽 **Clean uninstall** – flush rules, reset, and remove config/script.
 
 ## Security model at a glance
