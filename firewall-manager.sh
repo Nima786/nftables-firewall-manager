@@ -258,10 +258,20 @@ EOF
 
   if nft -f "$tmp_rules"; then
     echo -e "\n${GREEN}Firewall configuration applied successfully!${NC}"
-    echo -e "${YELLOW}Saving rules to /etc/nftables.conf...${NC}"
-    nft list ruleset > /etc/nftables.conf
-    systemctl restart nftables.service >/dev/null 2>&1 || true
-    echo -e "${GREEN}Rules persisted.${NC}"
+    # ======== PERSIST ONLY OUR TABLE (do NOT overwrite global config) =========
+    echo -e "${YELLOW}Saving rules to /etc/nftables.d/firewall-manager.nft...${NC}"
+    mkdir -p /etc/nftables.d
+    nft list table inet firewall-manager > /etc/nftables.d/firewall-manager.nft
+
+    # Ensure a non-destructive include is present
+    if [ ! -f /etc/nftables.conf ]; then
+      printf '%s\n' 'include "/etc/nftables.d/*.nft"' > /etc/nftables.conf
+    elif ! grep -q 'include "/etc/nftables.d/\*\.nft"' /etc/nftables.conf; then
+      printf '\ninclude "/etc/nftables.d/*.nft"\n' >> /etc/nftables.conf
+    fi
+
+    echo -e "${GREEN}Rules saved. Other tables (Docker/UFW/system) were not touched.${NC}"
+    # ==========================================================================
   else
     echo -e "\n${RED}FATAL: Failed to apply nftables ruleset!${NC}"
     echo "Check for syntax errors or invalid entries in your config files."
@@ -430,14 +440,15 @@ manage_udp_ports_menu(){
 
 flush_rules(){
   clear
-  read -r -p "ARE YOU SURE? This will flush all rules and reset the configuration. (y/n): " confirm < /dev/tty
+  read -r -p "ARE YOU SURE? This will remove only the firewall-manager table and reset its config. (y/n): " confirm < /dev/tty
   if [[ "$confirm" =~ ^[yY]$ ]]; then
-    echo "[+] Flushing ruleset..."
-    nft flush ruleset
-    echo "flush ruleset" > /etc/nftables.conf
-    systemctl restart nftables.service || true
-    echo -e "${GREEN}All rules flushed. The firewall is now open.${NC}"
+    echo "[+] Deleting our nftables table (inet firewall-manager)..."
+    nft list table inet firewall-manager >/dev/null 2>&1 && nft delete table inet firewall-manager
+    echo "[+] Removing persisted table file..."
+    rm -f /etc/nftables.d/firewall-manager.nft
+    echo "[+] Removing our config directory..."
     rm -rf "$CONFIG_DIR"
+    echo -e "${GREEN}Done. Other tables (Docker/UFW/system) were not touched.${NC}"
     initial_setup
   else
     echo "Operation cancelled."
@@ -447,14 +458,13 @@ flush_rules(){
 
 uninstall_script(){
   clear; echo -e "${RED}--- UNINSTALL FIREWALL & SCRIPT ---${NC}"
-  read -r -p "ARE YOU SURE you want to permanently delete the firewall and this script? (y/n): " confirm < /dev/tty
+  read -r -p "ARE YOU SURE you want to delete ONLY the firewall-manager table + config and this script? (y/n): " confirm < /dev/tty
   if [[ "$confirm" =~ ^[yY]$ ]]; then
-    echo "[+] Flushing ruleset and disabling service..."
-    nft flush ruleset
-    echo "flush ruleset" > /etc/nftables.conf
-    systemctl restart nftables.service || true
-    systemctl disable nftables.service || true
-    echo "[+] Deleting configuration directory..."
+    echo "[+] Deleting our nftables table (inet firewall-manager)..."
+    nft list table inet firewall-manager >/dev/null 2>&1 && nft delete table inet firewall-manager
+    echo "[+] Removing persisted table file..."
+    rm -f /etc/nftables.d/firewall-manager.nft
+    echo "[+] Removing our config directory..."
     rm -rf "$CONFIG_DIR"
     echo -e "${GREEN}Firewall has been removed. The script will now self-destruct.${NC}"
     (sleep 1 && rm -f -- "$0") &
