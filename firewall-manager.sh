@@ -409,7 +409,16 @@ manage_ips_menu(){
   done
 }
 
-view_rules(){ clear; echo -e "${YELLOW}--- Current Active NFTABLES Ruleset ---${NC}"; nft list ruleset; press_enter_to_continue; }
+view_rules(){
+  clear
+  echo -e "${YELLOW}--- Current 'inet firewall-manager' table ---${NC}"
+  if nft list table inet firewall-manager >/dev/null 2>&1; then
+    nft list table inet firewall-manager
+  else
+    echo "Table 'inet firewall-manager' not found. Use option 2 to apply rules."
+  fi
+  press_enter_to_continue
+}
 
 manage_tcp_ports_menu(){
   while true; do
