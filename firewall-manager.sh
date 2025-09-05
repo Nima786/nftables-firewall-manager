@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =================================================================
-#  Interactive NFTABLES Firewall Manager - v3.5 (Definitive)
+#  Interactive NFTABLES Firewall Manager - v3.6 (Definitive)
 # =================================================================
 # - Final version incorporating all fixes and best practices.
 # - Enforces a secure 'policy drop' on the input chain.
