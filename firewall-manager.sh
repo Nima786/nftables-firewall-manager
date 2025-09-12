@@ -199,7 +199,9 @@ apply_rules(){
   declare -a DOCKER_IFACES=()
   mapfile -t DOCKER_IFACES < <(get_docker_ifaces || true) || true
 
-  nft list table inet firewall-manager >/dev/null 2>&1 && nft delete table inet firewall-manager >/dev/null 2>&1 || true
+if nft list table inet firewall-manager >/dev/null 2>&1; then
+  nft delete table inet firewall-manager >/dev/null 2>&1 || true
+fi
 
   local tmp_rules; tmp_rules=$(mktemp)
   {
@@ -498,7 +500,9 @@ flush_rules(){
   clear
   read -r -p "ARE YOU SURE? This removes ONLY the firewall-manager table & config. (y/n): " confirm < /dev/tty || true
   if [[ "${confirm:-n}" =~ ^[yY]$ ]]; then
-    nft list table inet firewall-manager >/dev/null 2>&1 && nft delete table inet firewall-manager >/dev/null 2>&1 || true
+    if nft list table inet firewall-manager >/dev/null 2>&1; then
+  nft delete table inet firewall-manager >/dev/null 2>&1 || true
+fi
     rm -f /etc/nftables.d/firewall-manager.nft || true
     rm -rf "$CONFIG_DIR" || true
     echo -e "${GREEN}Flushed our table and config. Other tables untouched.${NC}"
@@ -513,7 +517,9 @@ uninstall_script(){
   clear; echo -e "${RED}--- UNINSTALL FIREWALL MANAGER ---${NC}"
   read -r -p "This deletes our table, config, and this script. Proceed? (y/n): " confirm < /dev/tty || true
   if [[ "${confirm:-n}" =~ ^[yY]$ ]]; then
-    nft list table inet firewall-manager >/dev/null 2>&1 && nft delete table inet firewall-manager >/dev/null 2>&1 || true
+    if nft list table inet firewall-manager >/dev/null 2>&1; then
+  nft delete table inet firewall-manager >/dev/null 2>&1 || true
+fi
     rm -f /etc/nftables.d/firewall-manager.nft || true
     rm -rf "$CONFIG_DIR" || true
     echo -e "${GREEN}Firewall removed. Deleting script...${NC}"
