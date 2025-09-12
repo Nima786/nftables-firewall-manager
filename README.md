@@ -1,6 +1,7 @@
 <p align="center">
   <img src="https://github.com/Nima786/nftables-firewall-manager/blob/main/assets/firewall-manager-logo.webp" alt="Firewall Manager Logo" width="150"/>
 </p>
+
 <h1 align="center">NFTABLES Firewall Manager</h1>
 <p align="center">
   A powerful, menu-driven Bash utility for managing a hardened <code>nftables</code> firewall on Debian/Ubuntu systems.
@@ -10,128 +11,182 @@
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
 </p>
 
-- - -
+* * *
 
-## Quick Install
+Quick Install
+-------------
 
-Run the script directly from GitHub for a one-time execution. The script will guide you through the initial setup.
+Run the script directly from GitHub for a one‑time execution. The script guides you through setup.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Nima786/nftables-firewall-manager/main/firewall-manager.sh | sudo bash
-```
+    curl -fsSL https://raw.githubusercontent.com/Nima786/nftables-firewall-manager/main/firewall-manager.sh | sudo bash
+    
 
-- - -
+This tool manages its own rules in a dedicated `inet firewall-manager` table, without touching Docker/UFW/system tables. It persists its config to `/etc/nftables.d/firewall-manager.nft` and ensures an `include` in `/etc/nftables.conf`.
 
-This script transforms complex `nftables` management into a simple, interactive workflow. It uses modern, high-performance features and is built to be a "good neighbor" on your system, managing its own rules without interfering with other services like **Docker** or **UFW**.
-<br><br>
+<br>
 <p align="center">
   <img src="https://github.com/Nima786/nftables-firewall-manager/blob/main/assets/firewall-manager.webp" width="600"/>
 </p>
-<br>
 
-## Why Use This Script?
+* * *
 
-Managing firewalls can be complex, especially on servers running Docker, which often manipulates firewall rules and bypasses simpler tools. This script solves these problems by providing:
+Why This Script (vs. UFW & older frontends)?
+--------------------------------------------
 
-*   **A Modern Approach:** Uses `nftables`, the successor to `iptables`, for better performance and syntax.
-*   **Safe Coexistence:** Manages its rules in a dedicated `firewall-manager` table, never wiping rules created by Docker or other system services.
-*   **High Performance:** Uses `nftables` sets for blocklists, allowing it to handle tens of thousands of IPs with virtually no performance impact.
-*   **Simplicity:** An interactive menu that abstracts away complex `nftables` syntax.
+*   **Modern engine:** Uses `nftables` (the successor to iptables) for cleaner syntax and better performance.
+*   **True default‑deny everywhere:** _input, forward, output_ chains have `policy drop`, giving real egress control (UFW is typically inbound‑only).
+*   **Pre‑Docker priority:** Rules are installed at priority `-10` so they evaluate _before_ Docker’s default chains. You stay in control even with containers.
+*   **Efficient big blocklists:** Uses kernel _sets_ with `flags interval` and chunked loading; thousands of CIDRs are matched in O(1) set lookups. Way faster than listing individual rules.
+*   **Separation of concerns:** Lives in its own table, never clobbers Docker/UFW/system rules.
+*   **Smart UX:** Menus for inbound (panel/inbounds) and outbound (system/nodes/APIs) ports, plus automatic SSH detection and brute‑force throttling.
 
-- - -
+* * *
 
-## Features
+Features
+--------
 
-*   🛡️ **Hardened by Default**: The `input` chain uses a `drop` policy, denying all incoming traffic by default.
-*   🔐 **SSH Brute-Force Protection**: Automatically rate-limits new SSH connection attempts to block automated attacks.
-*   🚀 **High-Performance IP Blocking**: Uses `nftables` sets for instant lookups against large IP blocklists.
-*   🐍 **Intelligent Blocklist Pruning**: An embedded Python helper automatically de-duplicates and merges overlapping IP ranges for maximum efficiency.
-*   ✍️ **Firewall Logging**: Logs dropped packets to the system journal for visibility into scans and attacks.
-*   🧩 **Safe Docker Coexistence**: Manages its own firewall table surgically, never interfering with tables created by Docker.
-*   🌐 **Dynamic Blocklist**: Fetches and applies an updated IPv4 abuse list from an online source.
-*   ⚙️ **Multi-Port & Ranges**: Easily add or remove ports, like `80,443` or `1000-2000`.
-*   📦 **Auto-Dependencies**: Installs `nftables`, `curl`, and `python3` on the first run if they are missing.
-*   🧽 **Clean Uninstall**: Surgically removes only its own rules, files, and configuration, leaving the rest of the system untouched.
+*   🛡️ **Strict by default:** `input`, `forward`, `output` all default to `drop`.
+*   🔐 **SSH safety:** Auto‑detects SSH port and applies a dynamic set to rate‑limit new attempts (anti‑brute‑force).
+*   🌐 **Outbound control:** Minimal essentials are allowed by default: `udp` _53_ (DNS), `udp` _123_ (NTP), `tcp` _22_ (SSH), and `tcp` _80,443_ (HTTP/S) with a rate‑limit. Everything else is blocked unless you explicitly allow it via the menu.
+*   📦 **Docker‑aware:** Allows bridged interfaces (e.g., `docker0`, `br-*`) in `forward` so containers keep working while your host remains locked down.
+*   🚫 **High‑performance blocklist:** Downloads an IPv4 abuse/bogon list, prunes/merges CIDRs, and _loads in chunks_ into a kernel set after the table is created. Fast lookups, low CPU.
+*   🧠 **Resilient loading:** If Python/ipaddress pruning isn’t available, it falls back to the raw list; duplicates are de‑duplicated; the set is flushed before reload to avoid errors.
+*   🧩 **Non‑destructive:** Only its own table is created/removed. No changes to Docker/UFW/system tables.
+*   📝 **Clear logging:** Drops are logged with prefixes (`[NFT DROP in/out/fwd]`) for quick auditing.
+*   🧽 **Clean uninstall:** Removes only its table, persisted file, config (optionally the script itself).
 
-- - -
+* * *
 
-## Compatibility & Docker Coexistence
+Compatibility & Coexistence
+---------------------------
 
-*   **OS:** Ubuntu 20.04/22.04/24.04, Debian 11/12
-*   **IP Version:** The firewall uses the `inet` family to handle both IPv4 and IPv6 traffic. The dynamic blocklist and rate-limiting features in this script are focused on IPv4.
-*   **Docker:** This script is designed to work safely alongside Docker. Instead of using the old `DOCKER-USER` chain, it creates its own dedicated `firewall-manager` table and never interferes with the rules Docker creates. It correctly allows forwarded traffic from Docker's bridged networks.
+*   **OS:** Ubuntu 20.04/22.04/24.04, Debian 11/12.
+*   **IP version:** Rules run in `inet` family. The dynamic blocklist focuses on IPv4 (IPv6 default‑deny still applies unless you open ports).
+*   **Docker:** Safe alongside Docker; our table runs at priority `-10` (before Docker’s default rules at `0`), and bridged interfaces are accommodated.
+*   **UFW:** Can coexist, but if you want _one_ source of truth, disable UFW: `sudo ufw disable`. This script does _not_ modify UFW automatically.
 
-- - -
+* * *
 
-## Permanent Installation
+Permanent Installation
+----------------------
 
-This method downloads the script and places it in your system's path, allowing you to run it again later just by typing its name. This is the recommended approach for ongoing management.
+Install once and rerun anytime:
 
-```bash
-# Download the script
-sudo curl -fsSL https://raw.githubusercontent.com/Nima786/nftables-firewall-manager/main/firewall-manager.sh -o /usr/local/bin/firewall-manager
+    # Download
+    sudo curl -fsSL https://raw.githubusercontent.com/Nima786/nftables-firewall-manager/main/firewall-manager.sh -o /usr/local/bin/firewall-manager
+    
+    # Make executable
+    sudo chmod +x /usr/local/bin/firewall-manager
+    
+    # Run
+    sudo firewall-manager
+    
 
-# Make it executable
-sudo chmod +x /usr/local/bin/firewall-manager
+On the first run, dependencies are installed, a config directory is created, and the blocklist is fetched.
 
-# Run the script
-sudo firewall-manager
-```
+* * *
 
-On the first run, the script will install dependencies, create its configuration directory, and download the blocklist.
+Important Defaults
+------------------
 
-- - -
+*   **Inbound:** Only your detected SSH port is allowed by default. Add panel/inbound ports via the menu.
+*   **Outbound:** Defaults allow DNS(53/udp), NTP(123/udp), SSH(22/tcp), HTTP/HTTPS(80/443 tcp, rate‑limited). Add node/API ports via the menu if needed.
+*   **Persistence:** Rules are written to `/etc/nftables.d/firewall-manager.nft` and included from `/etc/nftables.conf`.
 
-## Menu Options Explained
+* * *
 
-*   **1) `View Current Firewall Rules`**: Shows only the rules in the `firewall-manager` table.
-*   **2) `Apply Firewall Rules from Config`**: Builds and applies the rules from your configuration files.
-*   **3) `Manage Allowed TCP Ports`**: Add/remove TCP ports or ranges.
-*   **4) `Manage Allowed UDP Ports`**: Add/remove UDP ports or ranges.
-*   **5) `Manage Blocked IPs`**: Add/remove IPv4 addresses or CIDR ranges from your blocklist.
-*   **6) `Update IP Blocklist from Source`**: Fetches the latest abuse list from the configured URL.
-*   **7) `Flush All Rules & Reset Config`**: Surgically deletes the `firewall-manager` table and resets the script's configuration.
-*   **8) `Uninstall Firewall & Script`**: Performs a clean removal of the `firewall-manager` table, all configuration, and the script itself.
-*   **9) `Exit`**: Exits the script.
+Menu Options Explained
+----------------------
 
-- - -
+*   **1) View Current Firewall Rules** — Shows only the `firewall-manager` table (and prints the `blocked_ips` set for visibility).
+*   **2) Apply Firewall Rules from Config** — Builds and applies rules from config files; loads the blocklist set in chunks; then persists.
+*   **3) Allow TCP Inbound Ports (For Panel/Inbounds)** — Add/remove TCP ports or ranges for _incoming_ traffic.
+*   **4) Allow UDP Inbound Ports (For Panel/Inbounds)** — Add/remove UDP ports or ranges for _incoming_ traffic.
+*   **5) Manage Blocked IPs** — Add/remove IPv4 addresses/CIDRs in your blocklist file.
+*   **6) Update IP Blocklist from Source** — Fetch the latest IPv4 abuse list and save it locally (applies on next “2) Apply”).
+*   **7) Allow Outbound Ports (For System/Nodes/APIs)** — Add/remove TCP/UDP _egress_ ports (e.g., node control/API ports).
+*   **8) Flush All Rules & Reset Config** — Deletes only the `firewall-manager` table and resets this tool’s config (other nftables tables untouched).
+*   **9) Uninstall Firewall & Script** — Removes the table, persisted file, config, and the script itself.
+*   **0) Exit**
 
-## Verification and Troubleshooting
+* * *
 
-Here are the correct commands to check that your firewall is working as intended.
+Configuration Files
+-------------------
 
-```bash
-# View the rules managed by this script
-sudo nft list table inet firewall-manager
+All configuration lives under `/etc/firewall_manager_nft/`:
 
-# See the full system ruleset, including Docker's tables
-sudo nft list ruleset
+*   `allowed_tcp_ports.conf` — Inbound TCP allowlist
+*   `allowed_udp_ports.conf` — Inbound UDP allowlist
+*   `allowed_node_tcp_ports.conf` — Outbound TCP allowlist
+*   `allowed_node_udp_ports.conf` — Outbound UDP allowlist
+*   `blocked_ips.conf` — IPv4 blocklist (downloaded/merged)
 
-# Check the contents of the dynamic SSH rate-limiting set
-sudo nft list set inet firewall-manager ssh_brute
+* * *
 
-# View the log of dropped packets
-journalctl -k | grep "NFTABLES DROP"
-```
+Verification & Troubleshooting
+------------------------------
 
-- - -
+    # View rules managed by this tool
+    sudo nft list table inet firewall-manager
+    
+    # See the full ruleset (including Docker)
+    sudo nft list ruleset
+    
+    # Check SSH brute-force dynamic set
+    sudo nft list set inet firewall-manager ssh_brute
+    
+    # Inspect blocklist set
+    sudo nft list set inet firewall-manager blocked_ips | head -n 100
+    
+    # View drops (input/output/forward)
+    journalctl -k | grep "NFT DROP"
+    
 
-## Emergency Rollback
+**Tip:** If you want this tool to be your single firewall authority, consider disabling UFW (`sudo ufw disable`) to avoid policy confusion.
 
-If you ever need to quickly disable the rules applied by this script without affecting other system rules, run this command:
+* * *
 
-```bash
-sudo nft delete table inet firewall-manager
-```
+Emergency Rollback
+------------------
 
-- - -
+Remove only this tool’s table (Docker/UFW/system rules remain):
 
-## Requirements
+    sudo nft delete table inet firewall-manager
+    
 
-*   An OS based on Debian/Ubuntu (e.g., Ubuntu 20.04+, Debian 11+).
-*   Root privileges (`sudo`) to run.
-*   Internet access for the initial download and for updating the blocklist.
+* * *
 
-## License
+Performance Notes
+-----------------
 
-This project is licensed under the MIT License.
+*   Blocklists are stored in a kernel _set_, not as one rule per IP. Lookups are extremely fast.
+*   `flags interval` and pruning merge overlapping CIDRs, minimizing memory and comparisons.
+*   Established/related traffic is accepted early, so most packets never hit expensive checks.
+
+* * *
+
+Requirements
+------------
+
+*   Ubuntu 20.04+ or Debian 11+
+*   `sudo` privileges
+*   Internet access (first run + blocklist updates)
+
+* * *
+
+License
+-------
+
+MIT
+
+* * *
+
+What’s New in v3.9.5
+--------------------
+
+*   Robust, chunked blocklist loading (after table creation) with prune fallback and safe deduplication.
+*   Outbound allowlist menu (System/Nodes/APIs) + minimal default egress allows with HTTP/HTTPS rate‑limit.
+*   Runs at priority `-10` to evaluate before Docker rules.
+*   Removed redundant `daddr` blocklist check from `INPUT` (kept in `FORWARD`/`OUTPUT`), preserving strictness while trimming one lookup.
+*   Persists rules _after_ loading the blocklist set for reliable reboots.
