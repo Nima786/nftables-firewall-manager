@@ -122,7 +122,8 @@ batch_load_blocklist() {
   local tmp_pruned; tmp_pruned=$(mktemp)
 
   # Generate pruned list with python; fall back to raw file if that fails/empty.
-  python3 - "$BLOCKED_IPS_FILE" > "$tmp_pruned" <<'PY'
+  # Generate pruned list with python; fall back to raw file if that fails/empty.
+  if ! python3 - "$BLOCKED_IPS_FILE" > "$tmp_pruned" <<'PY'
 import sys, ipaddress
 src_path = sys.argv[1] if len(sys.argv) > 1 else None
 fh = open(src_path, 'r') if src_path else sys.stdin
@@ -138,7 +139,12 @@ for line in fh:
 for n in ipaddress.collapse_addresses(nets):
     print(n)
 PY
-  if [ $? -ne 0 ] || [ ! -s "$tmp_pruned" ]; then
+  then
+    cp -f "$BLOCKED_IPS_FILE" "$tmp_pruned"
+  fi
+
+  # If pruning succeeded but produced nothing, also fall back.
+  if [ ! -s "$tmp_pruned" ]; then
     cp -f "$BLOCKED_IPS_FILE" "$tmp_pruned"
   fi
 
