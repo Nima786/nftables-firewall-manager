@@ -2,14 +2,15 @@
 set -euo pipefail
 
 # =================================================================
-#  NFTABLES Firewall Manager v3.9.5
+#  NFTABLES Firewall Manager v3.9.6
 #  - Strict default deny (INPUT/FORWARD/OUTPUT = drop; priority -10)
 #  - SSH auto-detect + brute-force limiter
 #  - Inbound allowlists (Panel/Inbounds) via menus
 #  - Outbound allowlists (System/Nodes/APIs) via menus
 #  - Blocklist loaded AFTER table creation, in CHUNKS, prune fallback
 #  - Docker bridges allowed in FORWARD
-#  - PATCH: Remove ip daddr @blocked_ips from INPUT only (keep in FWD/OUT)
+#  - Persistence fixes: dump AFTER set is populated + safe include
+#  - Menu fix: Option 6 returns to menu (pause)
 # =================================================================
 
 # --- CONFIG ---
@@ -121,8 +122,6 @@ batch_load_blocklist() {
   local chunk=200
   local tmp_pruned; tmp_pruned=$(mktemp)
 
-  # Generate pruned list with python; fall back to raw file if that fails/empty.
-  # Generate pruned list with python; fall back to raw file if that fails/empty.
   if ! python3 - "$BLOCKED_IPS_FILE" > "$tmp_pruned" <<'PY'
 import sys, ipaddress
 src_path = sys.argv[1] if len(sys.argv) > 1 else None
@@ -142,21 +141,16 @@ PY
   then
     cp -f "$BLOCKED_IPS_FILE" "$tmp_pruned"
   fi
-
-  # If pruning succeeded but produced nothing, also fall back.
   if [ ! -s "$tmp_pruned" ]; then
     cp -f "$BLOCKED_IPS_FILE" "$tmp_pruned"
   fi
 
-  # Deduplicate lines defensively.
   local tmp_unique; tmp_unique=$(mktemp)
   awk 'NF' "$tmp_pruned" | sort -u > "$tmp_unique"
   mv "$tmp_unique" "$tmp_pruned"
 
-  # Clear existing elements to avoid duplicate-add errors.
   nft flush set inet firewall-manager blocked_ips >/dev/null 2>&1 || true
 
-  # Load in chunks (do not let failures kill the script).
   set +e
   local buf=() count=0
   while IFS= read -r net; do
@@ -182,11 +176,21 @@ get_docker_ifaces(){
   ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | awk '/^(docker0|br-)/{print $1}'
 }
 
+# Ensure /etc/nftables.conf safely includes our persisted table
+ensure_global_include(){
+  mkdir -p /etc/nftables.d
+  if [ ! -f /etc/nftables.conf ]; then
+    printf '%s\n' 'include "/etc/nftables.d/*.nft"' > /etc/nftables.conf
+  elif ! grep -q 'include "/etc/nftables.d/\*\.nft"' /etc/nftables.conf; then
+    printf '\ninclude "/etc/nftables.d/*.nft"\n' >> /etc/nftables.conf
+  fi
+}
+
 # ---------------- Apply nft rules ----------------
 apply_rules(){
   local no_pause=false; [[ "${1:-}" == "--no-pause" ]] && no_pause=true
 
-  ensure_config_dir; ensure_blocklist_populated
+  ensure_config_dir; ensure_blocklist_populated; ensure_global_include
 
   local ssh_port; ssh_port=$(detect_ssh_port); ensure_ssh_in_config
 
@@ -199,9 +203,7 @@ apply_rules(){
   declare -a DOCKER_IFACES=()
   mapfile -t DOCKER_IFACES < <(get_docker_ifaces || true) || true
 
-if nft list table inet firewall-manager >/dev/null 2>&1; then
-  nft delete table inet firewall-manager >/dev/null 2>&1 || true
-fi
+  nft list table inet firewall-manager >/dev/null 2>&1 && nft delete table inet firewall-manager >/dev/null 2>&1 || true
 
   local tmp_rules; tmp_rules=$(mktemp)
   {
@@ -217,8 +219,7 @@ fi
     echo "    iif lo accept"
     echo "    ct state invalid drop"
     echo "    icmp type { echo-request,echo-reply,destination-unreachable,time-exceeded,parameter-problem } accept"
-    echo "    ip saddr @blocked_ips drop"    # keep source check
-    # PATCH: removed "ip daddr @blocked_ips drop" from INPUT
+    echo "    ip saddr @blocked_ips drop"
     echo "    ip saddr @ssh_brute limit rate over 4/minute burst 5 packets drop"
     echo "    tcp dport $ssh_port ct state new update @ssh_brute { ip saddr }"
     echo "    tcp dport $ssh_port accept"
@@ -249,7 +250,7 @@ fi
     echo "    log prefix \"[NFT DROP fwd] \" flags all counter drop"
     echo "  }"
 
-    # OUTPUT
+    # OUTPUT (kept your original behavior incl. blocklist checks)
     echo "  chain output {"
     echo "    type filter hook output priority -10;"
     echo "    policy drop;"
@@ -280,14 +281,12 @@ fi
     mkdir -p /etc/nftables.d
     nft list table inet firewall-manager > /etc/nftables.d/firewall-manager.nft 2>/dev/null || true
 
-    # Ensure global includes our per-table file
-    if [ ! -f /etc/nftables.conf ]; then
-      printf '%s\n' 'include "/etc/nftables.d/*.nft"' > /etc/nftables.conf
-    elif ! grep -q 'include "/etc/nftables.d/\*\.nft"' /etc/nftables.conf; then
-      printf '\ninclude "/etc/nftables.d/*.nft"\n' >> /etc/nftables.conf
-    fi
+    # Ensure global include is present (safe)
+    ensure_global_include
 
+    # Reload nftables service (ignore failures on distros that don't use it)
     systemctl reload nftables.service >/dev/null 2>&1 || true
+
     echo -e "${GREEN}Firewall rules applied and persisted.${NC}"
   else
     echo -e "${RED}Failed to apply nftables ruleset!${NC}"
@@ -500,9 +499,7 @@ flush_rules(){
   clear
   read -r -p "ARE YOU SURE? This removes ONLY the firewall-manager table & config. (y/n): " confirm < /dev/tty || true
   if [[ "${confirm:-n}" =~ ^[yY]$ ]]; then
-    if nft list table inet firewall-manager >/dev/null 2>&1; then
-  nft delete table inet firewall-manager >/dev/null 2>&1 || true
-fi
+    nft list table inet firewall-manager >/dev/null 2>&1 && nft delete table inet firewall-manager >/dev/null 2>&1 || true
     rm -f /etc/nftables.d/firewall-manager.nft || true
     rm -rf "$CONFIG_DIR" || true
     echo -e "${GREEN}Flushed our table and config. Other tables untouched.${NC}"
@@ -517,9 +514,7 @@ uninstall_script(){
   clear; echo -e "${RED}--- UNINSTALL FIREWALL MANAGER ---${NC}"
   read -r -p "This deletes our table, config, and this script. Proceed? (y/n): " confirm < /dev/tty || true
   if [[ "${confirm:-n}" =~ ^[yY]$ ]]; then
-    if nft list table inet firewall-manager >/dev/null 2>&1; then
-  nft delete table inet firewall-manager >/dev/null 2>&1 || true
-fi
+    nft list table inet firewall-manager >/dev/null 2>&1 && nft delete table inet firewall-manager >/dev/null 2>&1 || true
     rm -f /etc/nftables.d/firewall-manager.nft || true
     rm -rf "$CONFIG_DIR" || true
     echo -e "${GREEN}Firewall removed. Deleting script...${NC}"
@@ -536,7 +531,7 @@ main_menu(){
   while true; do
     clear
     echo "=========================================="
-    echo " NFTABLES FIREWALL MANAGER v3.9.5"
+    echo " NFTABLES FIREWALL MANAGER v3.9.6"
     echo "=========================================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
@@ -556,7 +551,7 @@ main_menu(){
       3) manage_tcp_ports_menu ;;
       4) manage_udp_ports_menu ;;
       5) manage_ips_menu ;;
-      6) update_blocklist ;;
+      6) update_blocklist; press_enter_to_continue ;;   # <— stay in menu
       7) manage_node_ports_menu ;;
       8) flush_rules ;;
       9) uninstall_script ;;
