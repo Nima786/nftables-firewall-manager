@@ -1,4 +1,3 @@
-sudo tee /usr/local/bin/firewall-manager >/dev/null <<'EOF'
 #!/bin/bash
 set -euo pipefail
 
@@ -595,6 +594,3 @@ ensure_config_dir
 ensure_ssh_in_config
 ensure_blocklist_populated
 main_menu
-EOF
-sudo chmod +x /usr/local/bin/firewall-manager
-sudo firewall-manager
