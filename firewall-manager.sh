@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =================================================================
-#  NFTABLES Firewall Manager v3.9.6
+#  NFTABLES Firewall Manager v3.10.0
 # =================================================================
 # - Strict default deny (INPUT/FORWARD/OUTPUT = drop; priority -10)
 # - SSH auto-detect + brute-force limiter
@@ -10,8 +10,8 @@ set -euo pipefail
 # - Outbound allowlists (System/Nodes/APIs) via menus
 # - Blocklist loaded AFTER table creation, in CHUNKS, prune fallback
 # - Docker bridges allowed in FORWARD
-# - Persistence enforced: /etc/nftables.conf includes /etc/nftables.d/*.nft
-#   and nftables.service is enabled+restarted
+# - NEW: Dedicated boot unit firewall-manager.service loads our table,
+#        independent of /etc/nftables.conf, so rules survive reboot.
 # - ShellCheck clean for SC2181/SC2015 patterns
 # - INPUT micro-optimization: drop saddr @blocked_ips only (daddr kept in FWD/OUT)
 # =================================================================
@@ -184,19 +184,38 @@ get_docker_ifaces(){
   ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | awk '/^(docker0|br-)/{print $1}'
 }
 
-# ---------------- Persistence enforcement ----------------
-ensure_persistence(){
-  mkdir -p /etc/nftables.d
-  if [ ! -f /etc/nftables.conf ]; then
-    printf 'flush ruleset\ninclude "/etc/nftables.d/*.nft"\n' > /etc/nftables.conf
-  elif ! grep -q 'include "/etc/nftables.d/\*\.nft"' /etc/nftables.conf; then
-    printf '\ninclude "/etc/nftables.d/*.nft"\n' >> /etc/nftables.conf
+# ---------------- Boot persistence (dedicated unit) ----------------
+ensure_boot_unit(){
+  local unit="/etc/systemd/system/firewall-manager.service"
+  # Create/refresh unit
+  cat > "$unit" <<'UNIT'
+[Unit]
+Description=Firewall Manager (nftables) - load dedicated table
+Documentation=https://github.com/Nima786/nftables-firewall-manager
+After=nftables.service network-pre.target
+Wants=network-pre.target
+ConditionPathExists=/etc/nftables.d/firewall-manager.nft
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/firewall-manager.nft
+ExecReload=/usr/sbin/nft -f /etc/nftables.d/firewall-manager.nft
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  systemctl daemon-reload
+  # Validate file parses before enabling the unit
+  if nft -c -f /etc/nftables.d/firewall-manager.nft >/dev/null 2>&1; then
+    systemctl enable --now firewall-manager.service >/dev/null 2>&1 || true
   fi
-  if systemctl list-unit-files | grep -q '^nftables\.service'; then
-    if ! systemctl is-enabled nftables >/dev/null 2>&1; then
-      systemctl enable nftables >/dev/null 2>&1 || true
-    fi
-    systemctl restart nftables >/dev/null 2>&1 || true
+}
+
+disable_boot_unit(){
+  if systemctl list-unit-files | grep -q '^firewall-manager\.service'; then
+    systemctl disable --now firewall-manager.service >/dev/null 2>&1 || true
   fi
 }
 
@@ -217,7 +236,7 @@ apply_rules(){
   declare -a DOCKER_IFACES=()
   mapfile -t DOCKER_IFACES < <(get_docker_ifaces || true) || true
 
-  # SC2015-safe: delete existing table only if it exists
+  # Delete existing table only if it exists (SC2015-safe)
   if nft list table inet firewall-manager >/dev/null 2>&1; then
     nft delete table inet firewall-manager >/dev/null 2>&1 || true
   fi
@@ -298,10 +317,10 @@ apply_rules(){
     mkdir -p /etc/nftables.d
     nft list table inet firewall-manager > /etc/nftables.d/firewall-manager.nft 2>/dev/null || true
 
-    # Ensure include + service enabled/restarted
-    ensure_persistence
+    # Ensure dedicated boot unit is present and enabled (independent of /etc/nftables.conf)
+    ensure_boot_unit
 
-    echo -e "${GREEN}Firewall rules applied and persisted.${NC}"
+    echo -e "${GREEN}Firewall rules applied, persisted, and boot loader configured.${NC}"
   else
     echo -e "${RED}Failed to apply nftables ruleset!${NC}"
   fi
@@ -518,9 +537,9 @@ flush_rules(){
     fi
     rm -f /etc/nftables.d/firewall-manager.nft || true
     rm -rf "$CONFIG_DIR" || true
+    disable_boot_unit
     echo -e "${GREEN}Flushed our table and config. Other tables untouched.${NC}"
     ensure_config_dir
-    ensure_persistence
   else
     echo "Cancelled."
   fi
@@ -536,6 +555,7 @@ uninstall_script(){
     fi
     rm -f /etc/nftables.d/firewall-manager.nft || true
     rm -rf "$CONFIG_DIR" || true
+    disable_boot_unit
     echo -e "${GREEN}Firewall removed. Deleting script...${NC}"
     (sleep 1 && rm -f -- "$0") &
     exit 0
@@ -550,7 +570,7 @@ main_menu(){
   while true; do
     clear
     echo "=========================================="
-    echo " NFTABLES FIREWALL MANAGER v3.9.6"
+    echo " NFTABLES FIREWALL MANAGER v3.10.0"
     echo "=========================================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
@@ -570,7 +590,7 @@ main_menu(){
       3) manage_tcp_ports_menu ;;
       4) manage_udp_ports_menu ;;
       5) manage_ips_menu ;;
-      6) update_blocklist ;;
+      6) update_blocklist; press_enter_to_continue ;;   # keep menu alive
       7) manage_node_ports_menu ;;
       8) flush_rules ;;
       9) uninstall_script ;;
@@ -585,5 +605,4 @@ prepare_system
 ensure_config_dir
 ensure_ssh_in_config
 ensure_blocklist_populated
-ensure_persistence
 main_menu
