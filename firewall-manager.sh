@@ -1,25 +1,25 @@
 #!/bin/bash
 set -euo pipefail
 
-# =================================================================
-#  NFTABLES Firewall Manager v3.9.8
-#  - Strict default deny (INPUT/FORWARD/OUTPUT = drop; priority -10)
-#  - SSH auto-detect (config-first, safe) + brute-force limiter
+# ============================================================
+#  NFTABLES Firewall Manager v3.9.6 (stable)
+#  - Strict default deny (INPUT/FORWARD/OUTPUT = drop; prio -10)
+#  - Safer SSH port detection (prefers sshd -T or config)
 #  - Inbound allowlists (Panel/Inbounds) via menus
 #  - Outbound allowlists (System/Nodes/APIs) via menus
-#  - Blocklist loaded AFTER table creation, in CHUNKS, prune fallback
-#  - Docker bridges allowed in FORWARD
-#  - Persistence: dump AFTER set is populated + safe include
-#  - Menu fix: Option 6 returns to menu (pause)
-#  - ShellCheck: no SC2015 / SC1073 / SC1133
-# =================================================================
+#  - Blocklist loaded AFTER table creation, in CHUNKS (pruned)
+#  - Docker bridges allowed via WILDCARDS (docker0, br-*, etc.)
+#  - Persists to /etc/nftables.d/firewall-manager.nft and survives reboot
+# ============================================================
 
 # --- CONFIG ---
 CONFIG_DIR="/etc/firewall_manager_nft"
-ALLOWED_TCP_PORTS_FILE="$CONFIG_DIR/allowed_tcp_ports.conf"     # inbound TCP
-ALLOWED_UDP_PORTS_FILE="$CONFIG_DIR/allowed_udp_ports.conf"     # inbound UDP
-ALLOWED_NODE_TCP_FILE="$CONFIG_DIR/allowed_node_tcp_ports.conf" # outbound TCP
-ALLOWED_NODE_UDP_FILE="$CONFIG_DIR/allowed_node_udp_ports.conf" # outbound UDP
+
+ALLOWED_TCP_PORTS_FILE="$CONFIG_DIR/allowed_tcp_ports.conf"       # inbound TCP
+ALLOWED_UDP_PORTS_FILE="$CONFIG_DIR/allowed_udp_ports.conf"       # inbound UDP
+ALLOWED_NODE_TCP_FILE="$CONFIG_DIR/allowed_node_tcp_ports.conf"   # outbound TCP
+ALLOWED_NODE_UDP_FILE="$CONFIG_DIR/allowed_node_udp_ports.conf"   # outbound UDP
+
 BLOCKED_IPS_FILE="$CONFIG_DIR/blocked_ips.conf"
 BLOCKLIST_URL="https://raw.githubusercontent.com/Kiya6955/Abuse-Defender/main/abuse-ips.ipv4"
 FIRST_RUN_STATE="$CONFIG_DIR/.system_prep_done"
@@ -30,6 +30,7 @@ press_enter_to_continue(){ echo ""; read -r -p "Press Enter to return..." < /dev
 
 ensure_config_dir(){
   mkdir -p "$CONFIG_DIR"
+  : >"$CONFIG_DIR/.keep" 2>/dev/null || true
   [ -f "$ALLOWED_TCP_PORTS_FILE" ] || : >"$ALLOWED_TCP_PORTS_FILE"
   [ -f "$ALLOWED_UDP_PORTS_FILE" ] || : >"$ALLOWED_UDP_PORTS_FILE"
   [ -f "$ALLOWED_NODE_TCP_FILE" ]  || : >"$ALLOWED_NODE_TCP_FILE"
@@ -50,44 +51,21 @@ prepare_system(){
   touch "$FIRST_RUN_STATE"
 }
 
-# ---------------- SSH port detection (config-first, safe) ----------------
+# ---------------- SSH port detection (robust) ----------------
 detect_ssh_port(){
-  # Prefer 'Port' from sshd_config and drop-ins.
-  local cfg_port
-  cfg_port="$(
-    {
-      awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2}' /etc/ssh/sshd_config 2>/dev/null
-      # shellcheck disable=SC2013,SC2035
-      awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2}' /etc/ssh/sshd_config.d/*.conf 2>/dev/null
-    } | awk 'NF{print; exit}'
-  )"
-
-  if [[ "${cfg_port:-}" =~ ^[0-9]+$ ]] && (( cfg_port>=1 && cfg_port<=65535 )); then
-    echo "$cfg_port"
-    return 0
+  local port=""
+  # 1) Preferred: sshd -T (does not require root to read config includes)
+  if command -v sshd >/dev/null 2>&1; then
+    port=$(sshd -T 2>/dev/null | awk '/^port[[:space:]]/{print $2; exit}' || true)
   fi
-
-  # Fallback: inspect sshd LISTEN sockets; ignore loopback and X11-forward (6010–6099).
-  while IFS= read -r addr; do
-    # addr examples: *:22, 0.0.0.0:22, [::]:22, 127.0.0.1:6010, [::1]:6011
-    local host="${addr%:*}"
-    local port="${addr##*:}"
-    host="${host#[}"; host="${host%]}"
-    if [[ "$host" == "127.0.0.1" || "$host" == "::1" ]]; then
-      continue
-    fi
-    if [[ "$port" =~ ^60[0-9][0-9]$ ]]; then
-      continue
-    fi
-    if [[ "$port" =~ ^[0-9]+$ ]] && (( port>=1 && port<=65535 )); then
-      echo "$port"
-      return 0
-    fi
-  done < <(ss -H -ltnp 2>/dev/null | awk '/LISTEN/ && /sshd/ {print $4}' | sort -u)
-
-  echo 22
+  # 2) Fallback: explicit Port in sshd_config
+  if [[ -z "${port:-}" ]]; then
+    port=$(grep -iE '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n1 || true)
+  fi
+  # 3) Final fallback: assume 22
+  [[ "$port" =~ ^[0-9]+$ ]] && ((port>=1 && port<=65535)) || port=22
+  echo "$port"
 }
-
 ensure_ssh_in_config(){
   local ssh_port; ssh_port=$(detect_ssh_port)
   grep -qx "$ssh_port" "$ALLOWED_TCP_PORTS_FILE" || echo "$ssh_port" >> "$ALLOWED_TCP_PORTS_FILE"
@@ -96,7 +74,10 @@ ensure_ssh_in_config(){
 # ---------------- Blocklist helpers ----------------
 canonicalize_blocklist_file(){
   local tmp; tmp=$(mktemp)
-  awk '{ gsub(/\r/,"") } /^[[:space:]]*#/ {next} {gsub(/^[[:space:]]+|[[:space:]]+$/,""); if(length)print}' "$BLOCKED_IPS_FILE" 2>/dev/null | sort -u > "$tmp"
+  awk '{ gsub(/\r/,"") }
+       /^[[:space:]]*#/ {next}
+       { gsub(/^[[:space:]]+|[[:space:]]+$/,""); if(length)print }' \
+      "$BLOCKED_IPS_FILE" 2>/dev/null | sort -u > "$tmp"
   mv "$tmp" "$BLOCKED_IPS_FILE"
 }
 get_clean_blocklist(){ canonicalize_blocklist_file; cat "$BLOCKED_IPS_FILE"; }
@@ -123,10 +104,11 @@ update_blocklist(){
   if curl -fsSL "$BLOCKLIST_URL" -o "$tmp"; then
     if [ -s "$tmp" ] && [ "$(wc -l < "$tmp")" -gt 5 ]; then
       sed -i 's/\r$//' "$tmp"
-      awk '/^[[:space:]]*#/ { next } { gsub(/^[[:space:]]+|[[:space:]]+$/,""); if (length($0)) print $0 }' "$tmp" | sort -u > "$BLOCKED_IPS_FILE"
+      awk '/^[[:space:]]*#/ { next } { gsub(/^[[:space:]]+|[[:space:]]+$/,""); if (length($0)) print $0 }' \
+        "$tmp" | sort -u > "$BLOCKED_IPS_FILE"
       rm -f "$tmp"
       echo -e "${GREEN}Blocklist updated.${NC}"
-      if [ "$is_initial" = false ]; then prompt_to_apply; fi
+      [[ "$is_initial" == false ]] && prompt_to_apply
       return 0
     fi
   fi
@@ -148,6 +130,7 @@ batch_load_blocklist() {
   local chunk=200
   local tmp_pruned; tmp_pruned=$(mktemp)
 
+  # Try to prune via python collapse; fall back to raw list if it fails/empty.
   if ! python3 - "$BLOCKED_IPS_FILE" > "$tmp_pruned" <<'PY'
 import sys, ipaddress
 src_path = sys.argv[1] if len(sys.argv) > 1 else None
@@ -167,16 +150,17 @@ PY
   then
     cp -f "$BLOCKED_IPS_FILE" "$tmp_pruned"
   fi
-  if [ ! -s "$tmp_pruned" ]; then
-    cp -f "$BLOCKED_IPS_FILE" "$tmp_pruned"
-  fi
+  [ -s "$tmp_pruned" ] || cp -f "$BLOCKED_IPS_FILE" "$tmp_pruned"
 
+  # Deduplicate lines defensively.
   local tmp_unique; tmp_unique=$(mktemp)
   awk 'NF' "$tmp_pruned" | sort -u > "$tmp_unique"
   mv "$tmp_unique" "$tmp_pruned"
 
+  # Clear existing elements to avoid duplicate-add errors.
   nft flush set inet firewall-manager blocked_ips >/dev/null 2>&1 || true
 
+  # Load in chunks (do not let failures kill the script).
   set +e
   local buf=() count=0
   while IFS= read -r net; do
@@ -197,26 +181,12 @@ PY
   rm -f "$tmp_pruned" || true
 }
 
-# ---------------- Docker detection ----------------
-get_docker_ifaces(){
-  ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | awk '/^(docker0|br-)/{print $1}'
-}
-
-# Ensure /etc/nftables.conf safely includes our persisted table
-ensure_global_include(){
-  mkdir -p /etc/nftables.d
-  if [ ! -f /etc/nftables.conf ]; then
-    printf '%s\n' 'include "/etc/nftables.d/*.nft"' > /etc/nftables.conf
-  elif ! grep -q 'include "/etc/nftables.d/\*\.nft"' /etc/nftables.conf; then
-    printf '\ninclude "/etc/nftables.d/*.nft"\n' >> /etc/nftables.conf
-  fi
-}
-
 # ---------------- Apply nft rules ----------------
 apply_rules(){
   local no_pause=false; [[ "${1:-}" == "--no-pause" ]] && no_pause=true
 
-  ensure_config_dir; ensure_blocklist_populated; ensure_global_include
+  ensure_config_dir
+  ensure_blocklist_populated
 
   local ssh_port; ssh_port=$(detect_ssh_port); ensure_ssh_in_config
 
@@ -226,9 +196,7 @@ apply_rules(){
   tcp_node=$(sort -un "$ALLOWED_NODE_TCP_FILE" 2>/dev/null | paste -sd, - || true)
   udp_node=$(sort -un "$ALLOWED_NODE_UDP_FILE" 2>/dev/null | paste -sd, - || true)
 
-  declare -a DOCKER_IFACES=()
-  mapfile -t DOCKER_IFACES < <(get_docker_ifaces || true) || true
-
+  # Delete our table if it exists
   if nft list table inet firewall-manager >/dev/null 2>&1; then
     nft delete table inet firewall-manager >/dev/null 2>&1 || true
   fi
@@ -237,26 +205,28 @@ apply_rules(){
   {
     echo "table inet firewall-manager {"
     echo "  set blocked_ips { type ipv4_addr; flags interval; }"
-    echo "  set ssh_brute { type ipv4_addr; flags dynamic,timeout; timeout 5m; }"
+    echo "  set ssh_brute   { type ipv4_addr; flags dynamic,timeout; timeout 5m; }"
 
     # INPUT
-    echo "  chain input {"
-    echo "    type filter hook input priority -10;"
-    echo "    policy drop;"
-    echo "    ct state { established,related } accept"
-    echo "    iif lo accept"
-    echo "    ct state invalid drop"
-    echo "    icmp type { echo-request,echo-reply,destination-unreachable,time-exceeded,parameter-problem } accept"
-    echo "    ip saddr @blocked_ips drop"
-    echo "    ip saddr @ssh_brute limit rate over 4/minute burst 5 packets drop"
-    echo "    tcp dport $ssh_port ct state new update @ssh_brute { ip saddr }"
-    echo "    tcp dport $ssh_port accept"
+    cat <<EOF
+  chain input {
+    type filter hook input priority -10;
+    policy drop;
+    ct state { established,related } accept
+    iif lo accept
+    ct state invalid drop
+    icmp type { echo-request,echo-reply,destination-unreachable,time-exceeded,parameter-problem } accept
+    ip saddr @blocked_ips drop
+    ip saddr @ssh_brute limit rate over 4/minute burst 5 packets drop
+    tcp dport $ssh_port ct state new update @ssh_brute { ip saddr }
+    tcp dport $ssh_port accept
+EOF
     [[ -n "${tcp_in}" ]] && echo "    tcp dport { $tcp_in } accept"
     [[ -n "${udp_in}" ]] && echo "    udp dport { $udp_in } accept"
-    echo "    log prefix \"[NFT DROP in] \" flags all counter drop"
+    echo '    log prefix "[NFT DROP in] " flags all counter drop'
     echo "  }"
 
-    # FORWARD
+    # FORWARD (wildcard Docker/CNI bridges)
     echo "  chain forward {"
     echo "    type filter hook forward priority -10;"
     echo "    policy drop;"
@@ -265,17 +235,21 @@ apply_rules(){
     echo "    ip saddr @blocked_ips drop"
     echo "    ip daddr @blocked_ips drop"
     echo "    udp dport 1-65535 limit rate over 200/second burst 5 packets drop"
-    for ifc in "${DOCKER_IFACES[@]}"; do
-      echo "    iifname \"$ifc\" accept"
-      echo "    oifname \"$ifc\" accept"
-    done
+    echo '    iifname "docker0" accept'
+    echo '    oifname "docker0" accept'
+    echo '    iifname "br-*" accept'
+    echo '    oifname "br-*" accept'
+    echo '    iifname "docker_gwbridge" accept'
+    echo '    oifname "docker_gwbridge" accept'
+    echo '    iifname "cni-*" accept'
+    echo '    oifname "cni-*" accept'
     echo "    udp dport { 53,123 } accept"
     echo "    tcp dport { 22 } accept"
     echo "    tcp dport { 80,443 } limit rate over 200/second burst 5 packets drop"
     echo "    tcp dport { 80,443 } accept"
     [[ -n "${tcp_node}" ]] && echo "    tcp dport { $tcp_node } accept"
     [[ -n "${udp_node}" ]] && echo "    udp dport { $udp_node } accept"
-    echo "    log prefix \"[NFT DROP fwd] \" flags all counter drop"
+    echo '    log prefix "[NFT DROP fwd] " flags all counter drop'
     echo "  }"
 
     # OUTPUT
@@ -292,7 +266,7 @@ apply_rules(){
     echo "    tcp dport { 80,443 } accept"
     [[ -n "${tcp_node}" ]] && echo "    tcp dport { $tcp_node } accept"
     [[ -n "${udp_node}" ]] && echo "    udp dport { $udp_node } accept"
-    echo "    log prefix \"[NFT DROP out] \" flags all counter drop"
+    echo '    log prefix "[NFT DROP out] " flags all counter drop'
     echo "  }"
 
     echo "}"
@@ -309,19 +283,21 @@ apply_rules(){
     mkdir -p /etc/nftables.d
     nft list table inet firewall-manager > /etc/nftables.d/firewall-manager.nft 2>/dev/null || true
 
-    # Ensure global include is present (safe)
-    ensure_global_include
+    # Ensure global includes our per-table file
+    if [ ! -f /etc/nftables.conf ]; then
+      printf '%s\n' 'include "/etc/nftables.d/*.nft"' > /etc/nftables.conf
+    elif ! grep -q 'include "/etc/nftables.d/\*\.nft"' /etc/nftables.conf; then
+      printf '\ninclude "/etc/nftables.d/*.nft"\n' >> /etc/nftables.conf
+    fi
 
-    # Reload nftables service (ignore failures on distros that don't use it)
     systemctl reload nftables.service >/dev/null 2>&1 || true
-
     echo -e "${GREEN}Firewall rules applied and persisted.${NC}"
   else
     echo -e "${RED}Failed to apply nftables ruleset!${NC}"
   fi
 
   rm -f "$tmp_rules" || true
-  if [ "$no_pause" = false ]; then press_enter_to_continue; fi
+  [[ "$no_pause" == false ]] && press_enter_to_continue
 }
 
 prompt_to_apply(){ apply_rules --no-pause; }
@@ -336,13 +312,13 @@ parse_and_process_ports(){
       local start_port end_port; start_port=${item%-*}; end_port=${item#*-}
       if [[ "$start_port" =~ ^[0-9]+$ && "$end_port" =~ ^[0-9]+$ && "$start_port" -le "$end_port" ]]; then
         for ((port=start_port; port<=end_port; port++)); do
-          if [[ "$action" == "add" ]] && ! grep -qx "$port" "$proto_file"; then echo "$port" >> "$proto_file"; ((count++)); fi
+          if [[ "$action" == "add"    ]] && ! grep -qx "$port" "$proto_file"; then echo "$port" >> "$proto_file"; ((count++)); fi
           if [[ "$action" == "remove" ]] &&  grep -qx "$port" "$proto_file"; then sed -i "/^${port}\$/d" "$proto_file"; ((count++)); fi
         done
       fi
     elif [[ "$item" =~ ^[0-9]+$ ]]; then
-      if [[ "$action" == "add" ]] && ! grep -qx "$item" "$proto_file"; then echo "$item" >> "$proto_file"; ((count++))
-      elif [[ "$action" == "remove" ]] && grep -qx "$item" "$proto_file"; then sed -i "/^${item}\$/d" "$proto_file"; ((count++)); fi
+      if   [[ "$action" == "add"    ]] && ! grep -qx "$item" "$proto_file"; then echo "$item" >> "$proto_file"; ((count++))
+      elif [[ "$action" == "remove" ]] &&  grep -qx "$item" "$proto_file"; then sed -i "/^${item}\$/d" "$proto_file"; ((count++)); fi
     fi
   done; echo "$count"
 }
@@ -435,7 +411,7 @@ remove_node_ports_interactive(){ local proto="$1" ; local proto_file
 
 manage_node_ports_menu(){
   while true; do
-    clear; echo "--- Allow Outbound Ports (For System/Nodes/APIs) ---"
+    clear; echo "--- Manage Allowed Outbound Ports (For System/Nodes/APIs) ---"
     echo "TCP outbound: $(sort -n "$ALLOWED_NODE_TCP_FILE" 2>/dev/null | paste -s -d, || echo "None")"
     echo "UDP outbound: $(sort -n "$ALLOWED_NODE_UDP_FILE" 2>/dev/null | paste -s -d, || echo "None")"
     echo
@@ -496,7 +472,7 @@ manage_ips_menu(){
 
 manage_tcp_ports_menu(){
   while true; do
-    clear; echo "--- Allow TCP Inbound Ports (For Panel/Inbounds) ---"
+    clear; echo "--- Manage Allowed TCP Inbound Ports (For Panel/Inbounds) ---"
     echo "1) Add TCP Port(s)"; echo "2) Remove TCP Port(s)"; echo "3) Back"
     read -r -p "Choose an option: " choice < /dev/tty || true
     case "${choice:-}" in
@@ -509,7 +485,7 @@ manage_tcp_ports_menu(){
 }
 manage_udp_ports_menu(){
   while true; do
-    clear; echo "--- Allow UDP Inbound Ports (For Panel/Inbounds) ---"
+    clear; echo "--- Manage Allowed UDP Inbound Ports (For Panel/Inbounds) ---"
     echo "1) Add UDP Port(s)"; echo "2) Remove UDP Port(s)"; echo "3) Back"
     read -r -p "Choose an option: " choice < /dev/tty || true
     case "${choice:-}" in
@@ -563,7 +539,7 @@ main_menu(){
   while true; do
     clear
     echo "=========================================="
-    echo " NFTABLES FIREWALL MANAGER v3.9.8"
+    echo " NFTABLES FIREWALL MANAGER v3.9.6"
     echo "=========================================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
@@ -583,7 +559,7 @@ main_menu(){
       3) manage_tcp_ports_menu ;;
       4) manage_udp_ports_menu ;;
       5) manage_ips_menu ;;
-      6) update_blocklist; press_enter_to_continue ;;
+      6) update_blocklist ;;   # stays in menu
       7) manage_node_ports_menu ;;
       8) flush_rules ;;
       9) uninstall_script ;;
