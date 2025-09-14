@@ -2,15 +2,16 @@
 set -euo pipefail
 
 # =================================================================
-#  NFTABLES Firewall Manager v3.9.6
+#  NFTABLES Firewall Manager v3.9.7
 #  - Strict default deny (INPUT/FORWARD/OUTPUT = drop; priority -10)
-#  - SSH auto-detect + brute-force limiter
+#  - SSH auto-detect (config-first) + brute-force limiter
 #  - Inbound allowlists (Panel/Inbounds) via menus
 #  - Outbound allowlists (System/Nodes/APIs) via menus
 #  - Blocklist loaded AFTER table creation, in CHUNKS, prune fallback
 #  - Docker bridges allowed in FORWARD
-#  - Persistence fixes: dump AFTER set is populated + safe include
+#  - Persistence: dump AFTER set is populated + safe include
 #  - Menu fix: Option 6 returns to menu (pause)
+#  - ShellCheck fix: remove A && B || true chains (SC2015)
 # =================================================================
 
 # --- CONFIG ---
@@ -49,19 +50,49 @@ prepare_system(){
   touch "$FIRST_RUN_STATE"
 }
 
-# ---------------- SSH port detection ----------------
+# ---------------- SSH port detection (config-first, safe) ----------------
 detect_ssh_port(){
-  local port=""
-  port=$(
-    ss -ltn 2>/dev/null | awk '/LISTEN/ {sub(/.*:/,"",$4); print $4}' |
-    while read -r p; do ss -ltnp "sport = :$p" 2>/dev/null | grep -q sshd && { echo "$p"; break; }; done || true
-  )
-  if [[ -z "${port:-}" ]]; then
-    port=$(grep -iE '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n1 || true)
+  # Prefer ports explicitly configured in sshd_config and drop-ins.
+  # If none, fall back to ss(8) but ignore loopback and X11 (6010–6099).
+  local cfg_port=""
+  cfg_port=$(
+    awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2}' \
+      /etc/ssh/sshd_config 2>/dev/null
+    awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2}' \
+      /etc/ssh/sshd_config.d/*.conf 2>/dev/null
+  | awk 'NF' | head -n1 || true)
+
+  if [[ "$cfg_port" =~ ^[0-9]+$ ]] && (( cfg_port>=1 && cfg_port<=65535 )); then
+    echo "$cfg_port"
+    return 0
   fi
-  [[ "$port" =~ ^[0-9]+$ ]] && ((port>=1 && port<=65535)) || port=22
-  echo "$port"
+
+  # Fallback: inspect LISTEN sockets owned by sshd; skip loopback & X11-forward ports.
+  while IFS= read -r addr; do
+    # addr examples: *:22, 0.0.0.0:22, [::]:22, 127.0.0.1:6010, [::1]:6011
+    local host="${addr%:*}"
+    local port="${addr##*:}"
+    # normalize host by trimming brackets
+    host="${host#[}"
+    host="${host%]}"
+
+    # Ignore loopback-only listeners and X11 ports (6010–6099)
+    if [[ "$host" == "127.0.0.1" || "$host" == "::1" ]]; then
+      continue
+    fi
+    if [[ "$port" =~ ^60[0-9][0-9]$ ]]; then
+      continue
+    fi
+    if [[ "$port" =~ ^[0-9]+$ ]] && (( port>=1 && port<=65535 )); then
+      echo "$port"
+      return 0
+    fi
+  done < <(ss -H -ltnp 2>/dev/null | awk '/LISTEN/ && /sshd/ {print $4}' | sort -u)
+
+  # Last resort
+  echo 22
 }
+
 ensure_ssh_in_config(){
   local ssh_port; ssh_port=$(detect_ssh_port)
   grep -qx "$ssh_port" "$ALLOWED_TCP_PORTS_FILE" || echo "$ssh_port" >> "$ALLOWED_TCP_PORTS_FILE"
@@ -203,7 +234,9 @@ apply_rules(){
   declare -a DOCKER_IFACES=()
   mapfile -t DOCKER_IFACES < <(get_docker_ifaces || true) || true
 
-  nft list table inet firewall-manager >/dev/null 2>&1 && nft delete table inet firewall-manager >/dev/null 2>&1 || true
+  if nft list table inet firewall-manager >/dev/null 2>&1; then
+    nft delete table inet firewall-manager >/dev/null 2>&1 || true
+  fi
 
   local tmp_rules; tmp_rules=$(mktemp)
   {
@@ -250,7 +283,7 @@ apply_rules(){
     echo "    log prefix \"[NFT DROP fwd] \" flags all counter drop"
     echo "  }"
 
-    # OUTPUT (kept your original behavior incl. blocklist checks)
+    # OUTPUT
     echo "  chain output {"
     echo "    type filter hook output priority -10;"
     echo "    policy drop;"
@@ -499,7 +532,9 @@ flush_rules(){
   clear
   read -r -p "ARE YOU SURE? This removes ONLY the firewall-manager table & config. (y/n): " confirm < /dev/tty || true
   if [[ "${confirm:-n}" =~ ^[yY]$ ]]; then
-    nft list table inet firewall-manager >/dev/null 2>&1 && nft delete table inet firewall-manager >/dev/null 2>&1 || true
+    if nft list table inet firewall-manager >/dev/null 2>&1; then
+      nft delete table inet firewall-manager >/dev/null 2>&1 || true
+    fi
     rm -f /etc/nftables.d/firewall-manager.nft || true
     rm -rf "$CONFIG_DIR" || true
     echo -e "${GREEN}Flushed our table and config. Other tables untouched.${NC}"
@@ -514,7 +549,9 @@ uninstall_script(){
   clear; echo -e "${RED}--- UNINSTALL FIREWALL MANAGER ---${NC}"
   read -r -p "This deletes our table, config, and this script. Proceed? (y/n): " confirm < /dev/tty || true
   if [[ "${confirm:-n}" =~ ^[yY]$ ]]; then
-    nft list table inet firewall-manager >/dev/null 2>&1 && nft delete table inet firewall-manager >/dev/null 2>&1 || true
+    if nft list table inet firewall-manager >/dev/null 2>&1; then
+      nft delete table inet firewall-manager >/dev/null 2>&1 || true
+    fi
     rm -f /etc/nftables.d/firewall-manager.nft || true
     rm -rf "$CONFIG_DIR" || true
     echo -e "${GREEN}Firewall removed. Deleting script...${NC}"
@@ -531,7 +568,7 @@ main_menu(){
   while true; do
     clear
     echo "=========================================="
-    echo " NFTABLES FIREWALL MANAGER v3.9.6"
+    echo " NFTABLES FIREWALL MANAGER v3.9.7"
     echo "=========================================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
@@ -551,7 +588,7 @@ main_menu(){
       3) manage_tcp_ports_menu ;;
       4) manage_udp_ports_menu ;;
       5) manage_ips_menu ;;
-      6) update_blocklist; press_enter_to_continue ;;   # <— stay in menu
+      6) update_blocklist; press_enter_to_continue ;;
       7) manage_node_ports_menu ;;
       8) flush_rules ;;
       9) uninstall_script ;;
