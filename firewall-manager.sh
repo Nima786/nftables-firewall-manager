@@ -2,16 +2,16 @@
 set -euo pipefail
 
 # =================================================================
-#  NFTABLES Firewall Manager v3.9.7
+#  NFTABLES Firewall Manager v3.9.8
 #  - Strict default deny (INPUT/FORWARD/OUTPUT = drop; priority -10)
-#  - SSH auto-detect (config-first) + brute-force limiter
+#  - SSH auto-detect (config-first, safe) + brute-force limiter
 #  - Inbound allowlists (Panel/Inbounds) via menus
 #  - Outbound allowlists (System/Nodes/APIs) via menus
 #  - Blocklist loaded AFTER table creation, in CHUNKS, prune fallback
 #  - Docker bridges allowed in FORWARD
 #  - Persistence: dump AFTER set is populated + safe include
 #  - Menu fix: Option 6 returns to menu (pause)
-#  - ShellCheck fix: remove A && B || true chains (SC2015)
+#  - ShellCheck: no SC2015 / SC1073 / SC1133
 # =================================================================
 
 # --- CONFIG ---
@@ -52,31 +52,27 @@ prepare_system(){
 
 # ---------------- SSH port detection (config-first, safe) ----------------
 detect_ssh_port(){
-  # Prefer ports explicitly configured in sshd_config and drop-ins.
-  # If none, fall back to ss(8) but ignore loopback and X11 (6010–6099).
-  local cfg_port=""
-  cfg_port=$(
-    awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2}' \
-      /etc/ssh/sshd_config 2>/dev/null
-    awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2}' \
-      /etc/ssh/sshd_config.d/*.conf 2>/dev/null
-  | awk 'NF' | head -n1 || true)
+  # Prefer 'Port' from sshd_config and drop-ins.
+  local cfg_port
+  cfg_port="$(
+    {
+      awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2}' /etc/ssh/sshd_config 2>/dev/null
+      # shellcheck disable=SC2013,SC2035
+      awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2}' /etc/ssh/sshd_config.d/*.conf 2>/dev/null
+    } | awk 'NF{print; exit}'
+  )"
 
-  if [[ "$cfg_port" =~ ^[0-9]+$ ]] && (( cfg_port>=1 && cfg_port<=65535 )); then
+  if [[ "${cfg_port:-}" =~ ^[0-9]+$ ]] && (( cfg_port>=1 && cfg_port<=65535 )); then
     echo "$cfg_port"
     return 0
   fi
 
-  # Fallback: inspect LISTEN sockets owned by sshd; skip loopback & X11-forward ports.
+  # Fallback: inspect sshd LISTEN sockets; ignore loopback and X11-forward (6010–6099).
   while IFS= read -r addr; do
     # addr examples: *:22, 0.0.0.0:22, [::]:22, 127.0.0.1:6010, [::1]:6011
     local host="${addr%:*}"
     local port="${addr##*:}"
-    # normalize host by trimming brackets
-    host="${host#[}"
-    host="${host%]}"
-
-    # Ignore loopback-only listeners and X11 ports (6010–6099)
+    host="${host#[}"; host="${host%]}"
     if [[ "$host" == "127.0.0.1" || "$host" == "::1" ]]; then
       continue
     fi
@@ -89,7 +85,6 @@ detect_ssh_port(){
     fi
   done < <(ss -H -ltnp 2>/dev/null | awk '/LISTEN/ && /sshd/ {print $4}' | sort -u)
 
-  # Last resort
   echo 22
 }
 
@@ -131,7 +126,7 @@ update_blocklist(){
       awk '/^[[:space:]]*#/ { next } { gsub(/^[[:space:]]+|[[:space:]]+$/,""); if (length($0)) print $0 }' "$tmp" | sort -u > "$BLOCKED_IPS_FILE"
       rm -f "$tmp"
       echo -e "${GREEN}Blocklist updated.${NC}"
-      [[ "$is_initial" == false ]] && prompt_to_apply
+      if [ "$is_initial" = false ]; then prompt_to_apply; fi
       return 0
     fi
   fi
@@ -326,7 +321,7 @@ apply_rules(){
   fi
 
   rm -f "$tmp_rules" || true
-  [[ "$no_pause" == false ]] && press_enter_to_continue
+  if [ "$no_pause" = false ]; then press_enter_to_continue; fi
 }
 
 prompt_to_apply(){ apply_rules --no-pause; }
@@ -568,7 +563,7 @@ main_menu(){
   while true; do
     clear
     echo "=========================================="
-    echo " NFTABLES FIREWALL MANAGER v3.9.7"
+    echo " NFTABLES FIREWALL MANAGER v3.9.8"
     echo "=========================================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
