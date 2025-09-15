@@ -183,8 +183,6 @@ get_docker_ifaces(){
 }
 
 # ---------------- Apply nft rules ----------------
-
-# ---------------- Apply nft rules ----------------
 apply_rules(){
   local no_pause=false; [[ "${1:-}" == "--no-pause" ]] && no_pause=true
 
@@ -210,7 +208,7 @@ apply_rules(){
     echo "  set blocked_ips { type ipv4_addr; flags interval; }"
     echo "  set ssh_brute { type ipv4_addr; flags dynamic,timeout; timeout 5m; }"
 
-    # INPUT Chain (Unchanged)
+    # INPUT Chain: Remains STRICT (policy drop)
     echo "  chain input {"
     echo "    type filter hook input priority -10;"
     echo "    policy drop;"
@@ -227,46 +225,33 @@ apply_rules(){
     echo "    log prefix \"[NFT DROP in] \" flags all counter drop"
     echo "  }"
 
-    # FORWARD Chain (MAXIMUM SECURITY)
+    # FORWARD Chain: Remains STRICT (policy drop)
     echo "  chain forward {"
     echo "    type filter hook forward priority -10;"
-    echo "    policy drop;" # Default to drop
+    echo "    policy drop;"
     echo "    ct state { established,related } accept"
     echo "    ct state invalid drop"
     echo "    ip saddr @blocked_ips drop"
     echo "    ip daddr @blocked_ips drop"
-    
-    # --- START OF SECURITY HARDENING ---
-    # The permissive "iifname" rule has been REMOVED.
-    # We now ONLY allow traffic to/from Docker interfaces that is established/related
-    # OR traffic to specific ports you have approved via Option 7.
-    # This rule allows traffic to reach containers from the outside if it's allowed by INPUT.
     echo "    oifname $docker_ifaces accept"
-    # --- END OF SECURITY HARDENING ---
-
-    # Now, ONLY the ports you add via Option 7 will be allowed for outbound container traffic.
-    echo "    udp dport { 53, 123 } accept" # DNS and Time are essential
-    echo "    tcp dport { 80, 443 } accept" # Web access is common
+    echo "    udp dport { 53, 123 } accept"
+    echo "    tcp dport { 80, 443 } accept"
     [[ -n "${tcp_node}" ]] && echo "    tcp dport { $tcp_node } accept"
     [[ -n "${udp_node}" ]] && echo "    udp dport { $udp_node } accept"
     echo "    log prefix \"[NFT DROP fwd] \" flags all counter drop"
     echo "  }"
 
-    # OUTPUT Chain (Unchanged)
+    # --- START OF THE FINAL FIX ---
+    # OUTPUT Chain: Policy is changed to ACCEPT.
+    # This trusts the host's own processes (like Docker) and solves the timeout error.
+    # Security is maintained by the strict INPUT and FORWARD chains.
     echo "  chain output {"
     echo "    type filter hook output priority -10;"
-    echo "    policy drop;"
-    echo "    meta skuid root accept"
-    echo "    ct state { established,related } accept"
-    echo "    oif lo accept"
+    echo "    policy accept;"
+    # We can still add specific drop rules if we want.
     echo "    ip daddr @blocked_ips drop"
-    echo "    oifname $docker_ifaces accept"
-    echo "    udp dport { 53,123 } accept"
-    echo "    tcp dport { 22, 80, 443 } accept"
-    [[ -n "${tcp_node}" ]] && echo "    tcp dport { $tcp_node } accept"
-    [[ -n "${udp_node}" ]] && echo "    udp dport { $udp_node } accept"
-    echo "    log prefix \"[NFT DROP out] \" flags all counter drop"
     echo "  }"
+    # --- END OF THE FINAL FIX ---
 
     echo "}"
   } > "$tmp_rules"
