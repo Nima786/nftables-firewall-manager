@@ -163,7 +163,7 @@ PY
   rm -f "$tmp_pruned" || true
 }
 
-# ---------------- Apply nft rules (STABLE VERSION) ----------------
+# ---------------- Apply nft rules (FINAL STABLE & PERSISTENT VERSION) ----------------
 apply_rules(){
   local no_pause=false; [[ "${1:-}" == "--no-pause" ]] && no_pause=true
 
@@ -226,7 +226,6 @@ apply_rules(){
     echo "  chain output {"
     echo "    type filter hook output priority -10;"
     echo "    policy accept;"
-    # We still block outbound traffic to malicious IPs.
     echo "    ip daddr @blocked_ips drop"
     echo "  }"
 
@@ -240,9 +239,17 @@ apply_rules(){
       batch_load_blocklist
     fi
     mkdir -p /etc/nftables.d
-    nft list ruleset > /etc/nftables.d/firewall-manager.nft 2>/dev/null || true
+    
+    # --- START OF PERSISTENCE FIX ---
+    # This is the correct, precise way to save. It only saves OUR table,
+    # preventing conflicts with Docker's rules on reboot.
+    nft list table inet firewall-manager > /etc/nftables.d/firewall-manager.nft 2>/dev/null || true
+    # --- END OF PERSISTENCE FIX ---
+
     cat > /etc/nftables.conf <<EOF
 #!/usr/sbin/nft -f
+# This file is managed by the firewall script.
+# It flushes the old ruleset and includes only our managed table.
 flush ruleset
 include "/etc/nftables.d/firewall-manager.nft"
 EOF
