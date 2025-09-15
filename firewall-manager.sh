@@ -2,14 +2,11 @@
 set -euo pipefail
 
 # =================================================================
-#  NFTABLES Firewall Manager v3.9.6
-#  - Strict default deny (INPUT/FORWARD/OUTPUT = drop; priority -10)
-#  - SSH auto-detect + brute-force limiter
-#  - Inbound allowlists (Panel/Inbounds) via menus
-#  - Outbound allowlists (System/Nodes/APIs) via menus
-#  - Blocklist loaded AFTER table creation, in CHUNKS, prune fallback
-#  - Docker bridges allowed in FORWARD
-#  - PATCH: Remove ip daddr @blocked_ips from INPUT only (keep in FWD/OUT)
+#  NFTABLES Firewall Manager v4.0.0 (Stable)
+#  - FIX: Robust SSH port detection using sshd -T for accuracy.
+#  - FIX: Stable Docker operation by setting OUTPUT policy to ACCEPT.
+#  - Strict default deny for INPUT and FORWARD chains.
+#  - Full control over inbound ports and container outbound ports.
 # =================================================================
 
 # --- CONFIG ---
@@ -48,16 +45,18 @@ prepare_system(){
   touch "$FIRST_RUN_STATE"
 }
 
-# ---------------- SSH port detection ----------------
+# ---------------- SSH port detection (ROBUST FIX) ----------------
 detect_ssh_port(){
   local port=""
-  port=$(
-    ss -ltn 2>/dev/null | awk '/LISTEN/ {sub(/.*:/,"",$4); print $4}' |
-    while read -r p; do ss -ltnp "sport = :$p" 2>/dev/null | grep -q sshd && { echo "$p"; break; }; done || true
-  )
+  # 1) Preferred: sshd -T (queries the running sshd config directly)
+  if command -v sshd >/dev/null 2>&1; then
+    port=$(sshd -T 2>/dev/null | awk '/^port[[:space:]]/{print $2; exit}' || true)
+  fi
+  # 2) Fallback: explicit Port in sshd_config file
   if [[ -z "${port:-}" ]]; then
     port=$(grep -iE '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n1 || true)
   fi
+  # 3) Final fallback: assume 22
   [[ "$port" =~ ^[0-9]+$ ]] && ((port>=1 && port<=65535)) || port=22
   echo "$port"
 }
@@ -116,13 +115,9 @@ ensure_blocklist_populated(){
   fi
 }
 
-# Load the blocklist into nft set in chunks, prune if possible.
 batch_load_blocklist() {
   local chunk=200
   local tmp_pruned; tmp_pruned=$(mktemp)
-
-  # Generate pruned list with python; fall back to raw file if that fails/empty.
-  # Generate pruned list with python; fall back to raw file if that fails/empty.
   if ! python3 - "$BLOCKED_IPS_FILE" > "$tmp_pruned" <<'PY'
 import sys, ipaddress
 src_path = sys.argv[1] if len(sys.argv) > 1 else None
@@ -142,21 +137,13 @@ PY
   then
     cp -f "$BLOCKED_IPS_FILE" "$tmp_pruned"
   fi
-
-  # If pruning succeeded but produced nothing, also fall back.
   if [ ! -s "$tmp_pruned" ]; then
     cp -f "$BLOCKED_IPS_FILE" "$tmp_pruned"
   fi
-
-  # Deduplicate lines defensively.
   local tmp_unique; tmp_unique=$(mktemp)
   awk 'NF' "$tmp_pruned" | sort -u > "$tmp_unique"
   mv "$tmp_unique" "$tmp_pruned"
-
-  # Clear existing elements to avoid duplicate-add errors.
   nft flush set inet firewall-manager blocked_ips >/dev/null 2>&1 || true
-
-  # Load in chunks (do not let failures kill the script).
   set +e
   local buf=() count=0
   while IFS= read -r net; do
@@ -173,16 +160,10 @@ PY
     printf 'add element inet firewall-manager blocked_ips { %s }\n' "$csv" | nft -f - >/dev/null 2>&1
   fi
   set -e
-
   rm -f "$tmp_pruned" || true
 }
 
-# ---------------- Docker detection ----------------
-get_docker_ifaces(){
-  ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | awk '/^(docker0|br-)/{print $1}'
-}
-
-# ---------------- Apply nft rules ----------------
+# ---------------- Apply nft rules (STABLE VERSION) ----------------
 apply_rules(){
   local no_pause=false; [[ "${1:-}" == "--no-pause" ]] && no_pause=true
 
@@ -241,22 +222,18 @@ apply_rules(){
     echo "    log prefix \"[NFT DROP fwd] \" flags all counter drop"
     echo "  }"
 
-    # --- START OF THE FINAL FIX ---
-    # OUTPUT Chain: Policy is changed to ACCEPT.
-    # This trusts the host's own processes (like Docker) and solves the timeout error.
-    # Security is maintained by the strict INPUT and FORWARD chains.
+    # OUTPUT Chain: Policy is ACCEPT to ensure host/Docker stability.
     echo "  chain output {"
     echo "    type filter hook output priority -10;"
     echo "    policy accept;"
-    # We can still add specific drop rules if we want.
+    # We still block outbound traffic to malicious IPs.
     echo "    ip daddr @blocked_ips drop"
     echo "  }"
-    # --- END OF THE FINAL FIX ---
 
     echo "}"
   } > "$tmp_rules"
 
-  # Persistence logic is unchanged and correct
+  # Persistence logic
   if nft -f "$tmp_rules"; then
     if [ -s "$BLOCKED_IPS_FILE" ]; then
       echo -e "${YELLOW}Loading blocklist into set (chunked)...${NC}"
@@ -278,7 +255,10 @@ EOF
   [[ "$no_pause" == false ]] && press_enter_to_continue
 }
 
-# ---------------- Port helpers ----------------
+# --- The rest of the script is unchanged and correct ---
+
+prompt_to_apply(){ apply_rules --no-pause; }
+
 parse_and_process_ports(){
   local action="$1" proto_file="$2" input_ports="$3"; local -i count=0
   IFS=',' read -ra port_items <<< "$(echo "$input_ports" | tr ' ' ',')"
@@ -299,7 +279,6 @@ parse_and_process_ports(){
   done; echo "$count"
 }
 
-# ---------------- IP helpers ----------------
 valid_ipv4_cidr(){
   local s="$1" ip mask
   ip=${s%%/*}; mask=${s#*/}
@@ -331,7 +310,6 @@ parse_and_process_ips(){
   echo "$count"
 }
 
-# ---------------- Views ----------------
 view_rules(){
   clear
   echo -e "${YELLOW}--- Current 'inet firewall-manager' table ---${NC}"
@@ -346,7 +324,6 @@ view_rules(){
   press_enter_to_continue
 }
 
-# ---------------- Menus ----------------
 add_ports_interactive(){ local proto="$1" ; local proto_file
   [[ "$proto" == "TCP" ]] && proto_file="$ALLOWED_TCP_PORTS_FILE" || proto_file="$ALLOWED_UDP_PORTS_FILE"
   clear; echo -e "${YELLOW}--- Add Allowed ${proto} Ports (INBOUND / Panel-Inbounds) ---${NC}"
@@ -423,7 +400,6 @@ manage_ips_menu(){
     echo "3) Show full list"
     echo "4) Back"
     read -r -p "Choose an option: " choice < /dev/tty || true
-
     local did_change=0
     case "${choice:-}" in
       1) read -r -p "Enter IPs/CIDRs to ADD: " ips < /dev/tty || true
@@ -437,7 +413,6 @@ manage_ips_menu(){
       4) break ;;
       *) echo -e "${RED}Invalid option.${NC}"; sleep 1; continue ;;
     esac
-
     if (( did_change )); then
       echo -e "${YELLOW}Applying firewall...${NC}"
       apply_rules --no-pause || true
@@ -480,8 +455,8 @@ flush_rules(){
   read -r -p "ARE YOU SURE? This removes ONLY the firewall-manager table & config. (y/n): " confirm < /dev/tty || true
   if [[ "${confirm:-n}" =~ ^[yY]$ ]]; then
     if nft list table inet firewall-manager >/dev/null 2>&1; then
-  nft delete table inet firewall-manager >/dev/null 2>&1 || true
-fi
+      nft delete table inet firewall-manager >/dev/null 2>&1 || true
+    fi
     rm -f /etc/nftables.d/firewall-manager.nft || true
     rm -rf "$CONFIG_DIR" || true
     echo -e "${GREEN}Flushed our table and config. Other tables untouched.${NC}"
@@ -497,8 +472,8 @@ uninstall_script(){
   read -r -p "This deletes our table, config, and this script. Proceed? (y/n): " confirm < /dev/tty || true
   if [[ "${confirm:-n}" =~ ^[yY]$ ]]; then
     if nft list table inet firewall-manager >/dev/null 2>&1; then
-  nft delete table inet firewall-manager >/dev/null 2>&1 || true
-fi
+      nft delete table inet firewall-manager >/dev/null 2>&1 || true
+    fi
     rm -f /etc/nftables.d/firewall-manager.nft || true
     rm -rf "$CONFIG_DIR" || true
     echo -e "${GREEN}Firewall removed. Deleting script...${NC}"
@@ -515,7 +490,7 @@ main_menu(){
   while true; do
     clear
     echo "=========================================="
-    echo " NFTABLES FIREWALL MANAGER v3.9.6"
+    echo " NFTABLES FIREWALL MANAGER v4.0.0 (Stable)"
     echo "=========================================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
