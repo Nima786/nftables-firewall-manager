@@ -2,19 +2,19 @@
 set -euo pipefail
 
 # =================================================================
-#  NFTABLES Firewall Manager v4.0.0 (Stable)
-#  - FIX: Robust SSH port detection using sshd -T for accuracy.
-#  - FIX: Stable Docker operation by setting OUTPUT policy to ACCEPT.
-#  - Strict default deny for INPUT and FORWARD chains.
-#  - Full control over inbound ports and container outbound ports.
+#  NFTABLES Firewall Manager v5.0 (Final Stable)
+#  - Correctly detects SSH port using `sshd -T`.
+#  - Ensures Docker stability with `OUTPUT policy accept`.
+#  - Provides maximum security with `INPUT` and `FORWARD` drop policies.
+#  - Persists correctly on reboot without any manual systemd changes.
 # =================================================================
 
 # --- CONFIG ---
 CONFIG_DIR="/etc/firewall_manager_nft"
 ALLOWED_TCP_PORTS_FILE="$CONFIG_DIR/allowed_tcp_ports.conf"     # inbound TCP
 ALLOWED_UDP_PORTS_FILE="$CONFIG_DIR/allowed_udp_ports.conf"     # inbound UDP
-ALLOWED_NODE_TCP_FILE="$CONFIG_DIR/allowed_node_tcp_ports.conf" # outbound TCP
-ALLOWED_NODE_UDP_FILE="$CONFIG_DIR/allowed_node_udp_ports.conf" # outbound UDP
+ALLOWED_NODE_TCP_FILE="$CONFIG_DIR/allowed_node_tcp_ports.conf" # outbound TCP (for containers)
+ALLOWED_NODE_UDP_FILE="$CONFIG_DIR/allowed_node_udp_ports.conf" # outbound UDP (for containers)
 BLOCKED_IPS_FILE="$CONFIG_DIR/blocked_ips.conf"
 BLOCKLIST_URL="https://raw.githubusercontent.com/Kiya6955/Abuse-Defender/main/abuse-ips.ipv4"
 FIRST_RUN_STATE="$CONFIG_DIR/.system_prep_done"
@@ -45,7 +45,7 @@ prepare_system(){
   touch "$FIRST_RUN_STATE"
 }
 
-# ---------------- SSH port detection (ROBUST FIX) ----------------
+# ---------------- SSH port detection (ROBUST) ----------------
 detect_ssh_port(){
   local port=""
   # 1) Preferred: sshd -T (queries the running sshd config directly)
@@ -189,7 +189,7 @@ apply_rules(){
     echo "  set blocked_ips { type ipv4_addr; flags interval; }"
     echo "  set ssh_brute { type ipv4_addr; flags dynamic,timeout; timeout 5m; }"
 
-    # INPUT Chain: Remains STRICT (policy drop)
+    # INPUT Chain: Strict drop policy for maximum inbound security.
     echo "  chain input {"
     echo "    type filter hook input priority -10;"
     echo "    policy drop;"
@@ -206,7 +206,7 @@ apply_rules(){
     echo "    log prefix \"[NFT DROP in] \" flags all counter drop"
     echo "  }"
 
-    # FORWARD Chain: Remains STRICT (policy drop)
+    # FORWARD Chain: Strict drop policy to control container outbound traffic.
     echo "  chain forward {"
     echo "    type filter hook forward priority -10;"
     echo "    policy drop;"
@@ -222,7 +222,7 @@ apply_rules(){
     echo "    log prefix \"[NFT DROP fwd] \" flags all counter drop"
     echo "  }"
 
-    # OUTPUT Chain: Policy is ACCEPT to ensure host/Docker stability.
+    # OUTPUT Chain: Accept policy to ensure host/Docker stability.
     echo "  chain output {"
     echo "    type filter hook output priority -10;"
     echo "    policy accept;"
@@ -240,12 +240,11 @@ apply_rules(){
     fi
     mkdir -p /etc/nftables.d
     
-    # --- START OF PERSISTENCE FIX ---
     # This is the correct, precise way to save. It only saves OUR table,
     # preventing conflicts with Docker's rules on reboot.
     nft list table inet firewall-manager > /etc/nftables.d/firewall-manager.nft 2>/dev/null || true
-    # --- END OF PERSISTENCE FIX ---
 
+    # This is the correct, minimal config file for nftables.
     cat > /etc/nftables.conf <<EOF
 #!/usr/sbin/nft -f
 # This file is managed by the firewall script.
@@ -497,7 +496,7 @@ main_menu(){
   while true; do
     clear
     echo "=========================================="
-    echo " NFTABLES FIREWALL MANAGER v4.0.0 (Stable)"
+    echo " NFTABLES FIREWALL MANAGER v5.0 (Stable)"
     echo "=========================================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
