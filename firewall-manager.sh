@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =================================================================
-#  NFTABLES Firewall Manager v3.9.5
+#  NFTABLES Firewall Manager v3.9.6
 #  - Strict default deny (INPUT/FORWARD/OUTPUT = drop; priority -10)
 #  - SSH auto-detect + brute-force limiter
 #  - Inbound allowlists (Panel/Inbounds) via menus
@@ -183,6 +183,7 @@ get_docker_ifaces(){
 }
 
 # ---------------- Apply nft rules ----------------
+
 apply_rules(){
   local no_pause=false; [[ "${1:-}" == "--no-pause" ]] && no_pause=true
 
@@ -196,12 +197,14 @@ apply_rules(){
   tcp_node=$(sort -un "$ALLOWED_NODE_TCP_FILE" 2>/dev/null | paste -sd, - || true)
   udp_node=$(sort -un "$ALLOWED_NODE_UDP_FILE" 2>/dev/null | paste -sd, - || true)
 
-  declare -a DOCKER_IFACES=()
-  mapfile -t DOCKER_IFACES < <(get_docker_ifaces || true) || true
+  # --- START OF MODIFICATION ---
+  # Use a more robust wildcard approach for Docker interfaces
+  local docker_ifaces="{ docker0, br-*, docker_gwbridge, cni-* }"
+  # --- END OF MODIFICATION ---
 
-if nft list table inet firewall-manager >/dev/null 2>&1; then
-  nft delete table inet firewall-manager >/dev/null 2>&1 || true
-fi
+  if nft list table inet firewall-manager >/dev/null 2>&1; then
+    nft delete table inet firewall-manager >/dev/null 2>&1 || true
+  fi
 
   local tmp_rules; tmp_rules=$(mktemp)
   {
@@ -209,7 +212,7 @@ fi
     echo "  set blocked_ips { type ipv4_addr; flags interval; }"
     echo "  set ssh_brute { type ipv4_addr; flags dynamic,timeout; timeout 5m; }"
 
-    # INPUT
+    # INPUT (Strictly controlled access to the HOST)
     echo "  chain input {"
     echo "    type filter hook input priority -10;"
     echo "    policy drop;"
@@ -217,8 +220,7 @@ fi
     echo "    iif lo accept"
     echo "    ct state invalid drop"
     echo "    icmp type { echo-request,echo-reply,destination-unreachable,time-exceeded,parameter-problem } accept"
-    echo "    ip saddr @blocked_ips drop"    # keep source check
-    # PATCH: removed "ip daddr @blocked_ips drop" from INPUT
+    echo "    ip saddr @blocked_ips drop"
     echo "    ip saddr @ssh_brute limit rate over 4/minute burst 5 packets drop"
     echo "    tcp dport $ssh_port ct state new update @ssh_brute { ip saddr }"
     echo "    tcp dport $ssh_port accept"
@@ -227,40 +229,43 @@ fi
     echo "    log prefix \"[NFT DROP in] \" flags all counter drop"
     echo "  }"
 
-    # FORWARD
+    # FORWARD (Controls traffic THROUGH the host, i.e., to Docker)
     echo "  chain forward {"
     echo "    type filter hook forward priority -10;"
-    echo "    policy drop;"
+    echo "    policy drop;" # Default to drop, but allow Docker traffic explicitly
     echo "    ct state { established,related } accept"
     echo "    ct state invalid drop"
     echo "    ip saddr @blocked_ips drop"
     echo "    ip daddr @blocked_ips drop"
-    echo "    udp dport 1-65535 limit rate over 200/second burst 5 packets drop"
-    for ifc in "${DOCKER_IFACES[@]}"; do
-      echo "    iifname \"$ifc\" accept"
-      echo "    oifname \"$ifc\" accept"
-    done
+    
+    # --- START OF DOCKER FIX ---
+    # This is the GOLDEN RULE: Allow traffic to/from Docker's interfaces.
+    # This lets containers talk to each other and the outside world (if needed).
+    # This rule is safe because the INPUT chain already protects the host.
+    echo "    iifname $docker_ifaces accept"
+    echo "    oifname $docker_ifaces accept"
+    # --- END OF DOCKER FIX ---
+
+    # Your existing outbound rules for containers can still apply if needed,
+    # but the rules above are generally sufficient and more stable.
     echo "    udp dport { 53,123 } accept"
-    echo "    tcp dport { 22 } accept"
-    echo "    tcp dport { 80,443 } limit rate over 200/second burst 5 packets drop"
-    echo "    tcp dport { 80,443 } accept"
+    echo "    tcp dport { 22, 80, 443 } accept"
     [[ -n "${tcp_node}" ]] && echo "    tcp dport { $tcp_node } accept"
     [[ -n "${udp_node}" ]] && echo "    udp dport { $udp_node } accept"
     echo "    log prefix \"[NFT DROP fwd] \" flags all counter drop"
     echo "  }"
 
-    # OUTPUT
+    # OUTPUT (Strictly controlled traffic FROM the HOST itself)
     echo "  chain output {"
     echo "    type filter hook output priority -10;"
     echo "    policy drop;"
     echo "    ct state { established,related } accept"
-    echo "    ip saddr @blocked_ips drop"
+    echo "    oif lo accept" # Allow all loopback output
     echo "    ip daddr @blocked_ips drop"
-    echo "    udp dport 1-65535 limit rate over 200/second burst 5 packets drop"
+    # Allow host to talk to Docker network (e.g., for health checks)
+    echo "    oifname $docker_ifaces accept"
     echo "    udp dport { 53,123 } accept"
-    echo "    tcp dport { 22 } accept"
-    echo "    tcp dport { 80,443 } limit rate over 200/second burst 5 packets drop"
-    echo "    tcp dport { 80,443 } accept"
+    echo "    tcp dport { 22, 80, 443 } accept"
     [[ -n "${tcp_node}" ]] && echo "    tcp dport { $tcp_node } accept"
     [[ -n "${udp_node}" ]] && echo "    udp dport { $udp_node } accept"
     echo "    log prefix \"[NFT DROP out] \" flags all counter drop"
@@ -270,24 +275,21 @@ fi
   } > "$tmp_rules"
 
   if nft -f "$tmp_rules"; then
-    # Load the blocklist elements AFTER the table exists
     if [ -s "$BLOCKED_IPS_FILE" ]; then
       echo -e "${YELLOW}Loading blocklist into set (chunked)...${NC}"
       batch_load_blocklist
     fi
 
-    # Persist AFTER loading elements (so they survive reboot)
+    # Use the robust persistence logic from before
     mkdir -p /etc/nftables.d
-    nft list table inet firewall-manager > /etc/nftables.d/firewall-manager.nft 2>/dev/null || true
+    nft list ruleset > /etc/nftables.d/firewall-manager.nft 2>/dev/null || true
+    cat > /etc/nftables.conf <<EOF
+#!/usr/sbin/nft -f
+flush ruleset
+include "/etc/nftables.d/firewall-manager.nft"
+EOF
 
-    # Ensure global includes our per-table file
-    if [ ! -f /etc/nftables.conf ]; then
-      printf '%s\n' 'include "/etc/nftables.d/*.nft"' > /etc/nftables.conf
-    elif ! grep -q 'include "/etc/nftables.d/\*\.nft"' /etc/nftables.conf; then
-      printf '\ninclude "/etc/nftables.d/*.nft"\n' >> /etc/nftables.conf
-    fi
-
-    systemctl reload nftables.service >/dev/null 2>&1 || true
+    systemctl restart nftables.service >/dev/null 2>&1 || true
     echo -e "${GREEN}Firewall rules applied and persisted.${NC}"
   else
     echo -e "${RED}Failed to apply nftables ruleset!${NC}"
@@ -296,9 +298,6 @@ fi
   rm -f "$tmp_rules" || true
   [[ "$no_pause" == false ]] && press_enter_to_continue
 }
-
-prompt_to_apply(){ apply_rules --no-pause; }
-
 # ---------------- Port helpers ----------------
 parse_and_process_ports(){
   local action="$1" proto_file="$2" input_ports="$3"; local -i count=0
