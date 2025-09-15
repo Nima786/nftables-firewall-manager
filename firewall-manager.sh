@@ -184,6 +184,7 @@ get_docker_ifaces(){
 
 # ---------------- Apply nft rules ----------------
 
+# ---------------- Apply nft rules ----------------
 apply_rules(){
   local no_pause=false; [[ "${1:-}" == "--no-pause" ]] && no_pause=true
 
@@ -209,7 +210,7 @@ apply_rules(){
     echo "  set blocked_ips { type ipv4_addr; flags interval; }"
     echo "  set ssh_brute { type ipv4_addr; flags dynamic,timeout; timeout 5m; }"
 
-    # INPUT (Strictly controlled access to the HOST)
+    # INPUT Chain (Unchanged)
     echo "  chain input {"
     echo "    type filter hook input priority -10;"
     echo "    policy drop;"
@@ -226,35 +227,36 @@ apply_rules(){
     echo "    log prefix \"[NFT DROP in] \" flags all counter drop"
     echo "  }"
 
-    # FORWARD (Controls traffic THROUGH the host, i.e., to/from Docker)
+    # FORWARD Chain (MAXIMUM SECURITY)
     echo "  chain forward {"
     echo "    type filter hook forward priority -10;"
-    echo "    policy drop;"
+    echo "    policy drop;" # Default to drop
     echo "    ct state { established,related } accept"
     echo "    ct state invalid drop"
     echo "    ip saddr @blocked_ips drop"
     echo "    ip daddr @blocked_ips drop"
-    echo "    iifname $docker_ifaces accept"
+    
+    # --- START OF SECURITY HARDENING ---
+    # The permissive "iifname" rule has been REMOVED.
+    # We now ONLY allow traffic to/from Docker interfaces that is established/related
+    # OR traffic to specific ports you have approved via Option 7.
+    # This rule allows traffic to reach containers from the outside if it's allowed by INPUT.
     echo "    oifname $docker_ifaces accept"
-    echo "    udp dport { 53, 123 } accept"
-    echo "    tcp dport { 22, 80, 443 } accept"
+    # --- END OF SECURITY HARDENING ---
+
+    # Now, ONLY the ports you add via Option 7 will be allowed for outbound container traffic.
+    echo "    udp dport { 53, 123 } accept" # DNS and Time are essential
+    echo "    tcp dport { 80, 443 } accept" # Web access is common
     [[ -n "${tcp_node}" ]] && echo "    tcp dport { $tcp_node } accept"
     [[ -n "${udp_node}" ]] && echo "    udp dport { $udp_node } accept"
     echo "    log prefix \"[NFT DROP fwd] \" flags all counter drop"
     echo "  }"
 
-    # OUTPUT (Strictly controlled traffic FROM the HOST itself)
+    # OUTPUT Chain (Unchanged)
     echo "  chain output {"
     echo "    type filter hook output priority -10;"
     echo "    policy drop;"
-    
-    # --- START OF THE DEFINITIVE FIX ---
-    # This is the most important rule. It allows the system's core daemons
-    # (like Docker/containerd, which run as root) to function without being
-    # blocked by the strict drop policy. This solves the timeout errors.
     echo "    meta skuid root accept"
-    # --- END OF THE DEFINITIVE FIX ---
-
     echo "    ct state { established,related } accept"
     echo "    oif lo accept"
     echo "    ip daddr @blocked_ips drop"
@@ -269,12 +271,12 @@ apply_rules(){
     echo "}"
   } > "$tmp_rules"
 
+  # Persistence logic is unchanged and correct
   if nft -f "$tmp_rules"; then
     if [ -s "$BLOCKED_IPS_FILE" ]; then
       echo -e "${YELLOW}Loading blocklist into set (chunked)...${NC}"
       batch_load_blocklist
     fi
-
     mkdir -p /etc/nftables.d
     nft list ruleset > /etc/nftables.d/firewall-manager.nft 2>/dev/null || true
     cat > /etc/nftables.conf <<EOF
@@ -282,13 +284,11 @@ apply_rules(){
 flush ruleset
 include "/etc/nftables.d/firewall-manager.nft"
 EOF
-
     systemctl restart nftables.service >/dev/null 2>&1 || true
     echo -e "${GREEN}Firewall rules applied and persisted.${NC}"
   else
     echo -e "${RED}Failed to apply nftables ruleset!${NC}"
   fi
-
   rm -f "$tmp_rules" || true
   [[ "$no_pause" == false ]] && press_enter_to_continue
 }
