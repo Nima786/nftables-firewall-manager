@@ -197,10 +197,7 @@ apply_rules(){
   tcp_node=$(sort -un "$ALLOWED_NODE_TCP_FILE" 2>/dev/null | paste -sd, - || true)
   udp_node=$(sort -un "$ALLOWED_NODE_UDP_FILE" 2>/dev/null | paste -sd, - || true)
 
-  # --- START OF MODIFICATION ---
-  # Use a more robust wildcard approach for Docker interfaces
   local docker_ifaces="{ docker0, br-*, docker_gwbridge, cni-* }"
-  # --- END OF MODIFICATION ---
 
   if nft list table inet firewall-manager >/dev/null 2>&1; then
     nft delete table inet firewall-manager >/dev/null 2>&1 || true
@@ -229,26 +226,17 @@ apply_rules(){
     echo "    log prefix \"[NFT DROP in] \" flags all counter drop"
     echo "  }"
 
-    # FORWARD (Controls traffic THROUGH the host, i.e., to Docker)
+    # FORWARD (Controls traffic THROUGH the host, i.e., to/from Docker)
     echo "  chain forward {"
     echo "    type filter hook forward priority -10;"
-    echo "    policy drop;" # Default to drop, but allow Docker traffic explicitly
+    echo "    policy drop;"
     echo "    ct state { established,related } accept"
     echo "    ct state invalid drop"
     echo "    ip saddr @blocked_ips drop"
     echo "    ip daddr @blocked_ips drop"
-    
-    # --- START OF DOCKER FIX ---
-    # This is the GOLDEN RULE: Allow traffic to/from Docker's interfaces.
-    # This lets containers talk to each other and the outside world (if needed).
-    # This rule is safe because the INPUT chain already protects the host.
     echo "    iifname $docker_ifaces accept"
     echo "    oifname $docker_ifaces accept"
-    # --- END OF DOCKER FIX ---
-
-    # Your existing outbound rules for containers can still apply if needed,
-    # but the rules above are generally sufficient and more stable.
-    echo "    udp dport { 53,123 } accept"
+    echo "    udp dport { 53, 123 } accept"
     echo "    tcp dport { 22, 80, 443 } accept"
     [[ -n "${tcp_node}" ]] && echo "    tcp dport { $tcp_node } accept"
     [[ -n "${udp_node}" ]] && echo "    udp dport { $udp_node } accept"
@@ -259,10 +247,17 @@ apply_rules(){
     echo "  chain output {"
     echo "    type filter hook output priority -10;"
     echo "    policy drop;"
+    
+    # --- START OF THE DEFINITIVE FIX ---
+    # This is the most important rule. It allows the system's core daemons
+    # (like Docker/containerd, which run as root) to function without being
+    # blocked by the strict drop policy. This solves the timeout errors.
+    echo "    meta skuid root accept"
+    # --- END OF THE DEFINITIVE FIX ---
+
     echo "    ct state { established,related } accept"
-    echo "    oif lo accept" # Allow all loopback output
+    echo "    oif lo accept"
     echo "    ip daddr @blocked_ips drop"
-    # Allow host to talk to Docker network (e.g., for health checks)
     echo "    oifname $docker_ifaces accept"
     echo "    udp dport { 53,123 } accept"
     echo "    tcp dport { 22, 80, 443 } accept"
@@ -280,7 +275,6 @@ apply_rules(){
       batch_load_blocklist
     fi
 
-    # Use the robust persistence logic from before
     mkdir -p /etc/nftables.d
     nft list ruleset > /etc/nftables.d/firewall-manager.nft 2>/dev/null || true
     cat > /etc/nftables.conf <<EOF
@@ -298,6 +292,7 @@ EOF
   rm -f "$tmp_rules" || true
   [[ "$no_pause" == false ]] && press_enter_to_continue
 }
+
 # ---------------- Port helpers ----------------
 parse_and_process_ports(){
   local action="$1" proto_file="$2" input_ports="$3"; local -i count=0
