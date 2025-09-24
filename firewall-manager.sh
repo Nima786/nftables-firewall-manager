@@ -2,19 +2,24 @@
 set -euo pipefail
 
 # =================================================================
-#  NFTABLES Firewall Manager v5.0 (Final Stable)
+#  NFTABLES Firewall Manager v6.0 (Modular & Safe)
+#  - Uses a modular include directory (/etc/nftables.d/) for safe coexistence.
+#  - Automatically configures the main nftables.conf file once.
 #  - Correctly detects SSH port using `sshd -T`.
 #  - Ensures Docker stability with `OUTPUT policy accept`.
 #  - Provides maximum security with `INPUT` and `FORWARD` drop policies.
-#  - Persists correctly on reboot without any manual systemd changes.
 # =================================================================
 
 # --- CONFIG ---
 CONFIG_DIR="/etc/firewall_manager_nft"
-ALLOWED_TCP_PORTS_FILE="$CONFIG_DIR/allowed_tcp_ports.conf"     # inbound TCP
-ALLOWED_UDP_PORTS_FILE="$CONFIG_DIR/allowed_udp_ports.conf"     # inbound UDP
-ALLOWED_NODE_TCP_FILE="$CONFIG_DIR/allowed_node_tcp_ports.conf" # outbound TCP (for containers)
-ALLOWED_NODE_UDP_FILE="$CONFIG_DIR/allowed_node_udp_ports.conf" # outbound UDP (for containers)
+NFT_RULES_DIR="/etc/nftables.d"
+OUR_RULES_FILE="$NFT_RULES_DIR/firewall-manager.nft"
+
+ALLOWED_TCP_PORTS_FILE="$CONFIG_DIR/allowed_tcp_ports.conf"
+ALLOWED_UDP_PORTS_FILE="$CONFIG_DIR/allowed_udp_ports.conf"
+ALLOWED_NODE_TCP_FILE="$CONFIG_DIR/allowed_node_tcp_ports.conf" # for containers
+ALLOWED_NODE_UDP_FILE="$CONFIG_DIR/allowed_node_udp_ports.conf" # for containers
+
 BLOCKED_IPS_FILE="$CONFIG_DIR/blocked_ips.conf"
 BLOCKLIST_URL="https://raw.githubusercontent.com/Kiya6955/Abuse-Defender/main/abuse-ips.ipv4"
 FIRST_RUN_STATE="$CONFIG_DIR/.system_prep_done"
@@ -25,6 +30,7 @@ press_enter_to_continue(){ echo ""; read -r -p "Press Enter to return..." < /dev
 
 ensure_config_dir(){
   mkdir -p "$CONFIG_DIR"
+  mkdir -p "$NFT_RULES_DIR"
   [ -f "$ALLOWED_TCP_PORTS_FILE" ] || : >"$ALLOWED_TCP_PORTS_FILE"
   [ -f "$ALLOWED_UDP_PORTS_FILE" ] || : >"$ALLOWED_UDP_PORTS_FILE"
   [ -f "$ALLOWED_NODE_TCP_FILE" ]  || : >"$ALLOWED_NODE_TCP_FILE"
@@ -48,15 +54,12 @@ prepare_system(){
 # ---------------- SSH port detection (ROBUST) ----------------
 detect_ssh_port(){
   local port=""
-  # 1) Preferred: sshd -T (queries the running sshd config directly)
   if command -v sshd >/dev/null 2>&1; then
     port=$(sshd -T 2>/dev/null | awk '/^port[[:space:]]/{print $2; exit}' || true)
   fi
-  # 2) Fallback: explicit Port in sshd_config file
   if [[ -z "${port:-}" ]]; then
     port=$(grep -iE '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n1 || true)
   fi
-  # 3) Final fallback: assume 22
   [[ "$port" =~ ^[0-9]+$ ]] && ((port>=1 && port<=65535)) || port=22
   echo "$port"
 }
@@ -137,9 +140,7 @@ PY
   then
     cp -f "$BLOCKED_IPS_FILE" "$tmp_pruned"
   fi
-  if [ ! -s "$tmp_pruned" ]; then
-    cp -f "$BLOCKED_IPS_FILE" "$tmp_pruned"
-  fi
+  [ -s "$tmp_pruned" ] || cp -f "$BLOCKED_IPS_FILE" "$tmp_pruned"
   local tmp_unique; tmp_unique=$(mktemp)
   awk 'NF' "$tmp_pruned" | sort -u > "$tmp_unique"
   mv "$tmp_unique" "$tmp_pruned"
@@ -163,7 +164,7 @@ PY
   rm -f "$tmp_pruned" || true
 }
 
-# ---------------- Apply nft rules (FINAL STABLE & PERSISTENT VERSION) ----------------
+# ---------------- Apply nft rules (MODULAR & SAFE) ----------------
 apply_rules(){
   local no_pause=false; [[ "${1:-}" == "--no-pause" ]] && no_pause=true
 
@@ -191,8 +192,7 @@ apply_rules(){
 
     # INPUT Chain: Strict drop policy for maximum inbound security.
     echo "  chain input {"
-    echo "    type filter hook input priority -10;"
-    echo "    policy drop;"
+    echo "    type filter hook input priority -10; policy drop;"
     echo "    ct state { established,related } accept"
     echo "    iif lo accept"
     echo "    ct state invalid drop"
@@ -208,8 +208,7 @@ apply_rules(){
 
     # FORWARD Chain: Strict drop policy to control container outbound traffic.
     echo "  chain forward {"
-    echo "    type filter hook forward priority -10;"
-    echo "    policy drop;"
+    echo "    type filter hook forward priority -10; policy drop;"
     echo "    ct state { established,related } accept"
     echo "    ct state invalid drop"
     echo "    ip saddr @blocked_ips drop"
@@ -224,35 +223,36 @@ apply_rules(){
 
     # OUTPUT Chain: Accept policy to ensure host/Docker stability.
     echo "  chain output {"
-    echo "    type filter hook output priority -10;"
-    echo "    policy accept;"
+    echo "    type filter hook output priority -10; policy accept;"
     echo "    ip daddr @blocked_ips drop"
     echo "  }"
 
     echo "}"
   } > "$tmp_rules"
 
-  # Persistence logic
   if nft -f "$tmp_rules"; then
     if [ -s "$BLOCKED_IPS_FILE" ]; then
       echo -e "${YELLOW}Loading blocklist into set (chunked)...${NC}"
       batch_load_blocklist
     fi
-    mkdir -p /etc/nftables.d
     
-    # This is the correct, precise way to save. It only saves OUR table,
-    # preventing conflicts with Docker's rules on reboot.
-    nft list table inet firewall-manager > /etc/nftables.d/firewall-manager.nft 2>/dev/null || true
-
-    # This is the correct, minimal config file for nftables.
-    cat > /etc/nftables.conf <<EOF
+    # --- START OF MODULAR PERSISTENCE LOGIC ---
+    # 1. Ensure the main config file is set up for modular includes.
+    # This is a self-healing check that runs every time.
+    if ! grep -q 'include "/etc/nftables.d/\*\.nft"' /etc/nftables.conf 2>/dev/null; then
+      echo -e "${YELLOW}Configuring /etc/nftables.conf for modular rules...${NC}"
+      cat > /etc/nftables.conf <<EOF
 #!/usr/sbin/nft -f
-# This file is managed by the firewall script.
-# It flushes the old ruleset and includes only our managed table.
 flush ruleset
-include "/etc/nftables.d/firewall-manager.nft"
+include "/etc/nftables.d/*.nft"
 EOF
-    systemctl restart nftables.service >/dev/null 2>&1 || true
+    fi
+
+    # 2. Save our rules to our dedicated file in the include directory.
+    nft list table inet firewall-manager > "$OUR_RULES_FILE" 2>/dev/null || true
+    # --- END OF MODULAR PERSISTENCE LOGIC ---
+
+    systemctl reload nftables.service >/dev/null 2>&1 || true
     echo -e "${GREEN}Firewall rules applied and persisted.${NC}"
   else
     echo -e "${RED}Failed to apply nftables ruleset!${NC}"
@@ -261,10 +261,9 @@ EOF
   [[ "$no_pause" == false ]] && press_enter_to_continue
 }
 
-# --- The rest of the script is unchanged and correct ---
-
 prompt_to_apply(){ apply_rules --no-pause; }
 
+# ---------------- Port helpers ----------------
 parse_and_process_ports(){
   local action="$1" proto_file="$2" input_ports="$3"; local -i count=0
   IFS=',' read -ra port_items <<< "$(echo "$input_ports" | tr ' ' ',')"
@@ -285,6 +284,7 @@ parse_and_process_ports(){
   done; echo "$count"
 }
 
+# ---------------- IP helpers ----------------
 valid_ipv4_cidr(){
   local s="$1" ip mask
   ip=${s%%/*}; mask=${s#*/}
@@ -316,6 +316,7 @@ parse_and_process_ips(){
   echo "$count"
 }
 
+# ---------------- Views ----------------
 view_rules(){
   clear
   echo -e "${YELLOW}--- Current 'inet firewall-manager' table ---${NC}"
@@ -330,6 +331,7 @@ view_rules(){
   press_enter_to_continue
 }
 
+# ---------------- Menus ----------------
 add_ports_interactive(){ local proto="$1" ; local proto_file
   [[ "$proto" == "TCP" ]] && proto_file="$ALLOWED_TCP_PORTS_FILE" || proto_file="$ALLOWED_UDP_PORTS_FILE"
   clear; echo -e "${YELLOW}--- Add Allowed ${proto} Ports (INBOUND / Panel-Inbounds) ---${NC}"
@@ -458,14 +460,15 @@ view_rules_menu(){ view_rules; }
 
 flush_rules(){
   clear
-  read -r -p "ARE YOU SURE? This removes ONLY the firewall-manager table & config. (y/n): " confirm < /dev/tty || true
+  read -r -p "ARE YOU SURE? This removes ONLY our rules file & config. (y/n): " confirm < /dev/tty || true
   if [[ "${confirm:-n}" =~ ^[yY]$ ]]; then
     if nft list table inet firewall-manager >/dev/null 2>&1; then
       nft delete table inet firewall-manager >/dev/null 2>&1 || true
     fi
-    rm -f /etc/nftables.d/firewall-manager.nft || true
+    rm -f "$OUR_RULES_FILE" || true
     rm -rf "$CONFIG_DIR" || true
-    echo -e "${GREEN}Flushed our table and config. Other tables untouched.${NC}"
+    echo -e "${GREEN}Flushed our rules and config. Other rules untouched.${NC}"
+    systemctl reload nftables.service >/dev/null 2>&1 || true
     ensure_config_dir
   else
     echo "Cancelled."
@@ -475,14 +478,16 @@ flush_rules(){
 
 uninstall_script(){
   clear; echo -e "${RED}--- UNINSTALL FIREWALL MANAGER ---${NC}"
-  read -r -p "This deletes our table, config, and this script. Proceed? (y/n): " confirm < /dev/tty || true
+  read -r -p "This deletes our rules, config, and this script. Proceed? (y/n): " confirm < /dev/tty || true
   if [[ "${confirm:-n}" =~ ^[yY]$ ]]; then
     if nft list table inet firewall-manager >/dev/null 2>&1; then
       nft delete table inet firewall-manager >/dev/null 2>&1 || true
     fi
-    rm -f /etc/nftables.d/firewall-manager.nft || true
+    rm -f "$OUR_RULES_FILE" || true
     rm -rf "$CONFIG_DIR" || true
-    echo -e "${GREEN}Firewall removed. Deleting script...${NC}"
+    echo -e "${GREEN}Firewall removed. Reloading service...${NC}"
+    systemctl reload nftables.service >/dev/null 2>&1 || true
+    echo "Deleting script..."
     (sleep 1 && rm -f -- "$0") &
     exit 0
   else
@@ -496,7 +501,7 @@ main_menu(){
   while true; do
     clear
     echo "=========================================="
-    echo " NFTABLES FIREWALL MANAGER v5.0 (Stable)"
+    echo " NFTABLES FIREWALL MANAGER v6.0 (Modular)"
     echo "=========================================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
