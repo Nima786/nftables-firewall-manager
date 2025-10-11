@@ -259,9 +259,11 @@ EOF
 # (Menus, add/remove ports, view rules, uninstall, etc.)
 # Keep all of your existing helper and menu functions as-is.
 
-# Entry point
-prepare_system
-ensure_config_dir
-ensure_ssh_in_config
-ensure_blocklist_populated
-main_menu
+# -------- Safe entrypoint when piped through curl --------
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  prepare_system
+  ensure_config_dir
+  ensure_ssh_in_config
+  ensure_blocklist_populated
+  main_menu
+fi
