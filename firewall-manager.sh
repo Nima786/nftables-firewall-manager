@@ -217,7 +217,11 @@ apply_rules(){
     echo "    ip6 saddr @blocked_ips_v6 drop"
     echo "    ip daddr @blocked_ips drop"
     echo "    ip6 daddr @blocked_ips_v6 drop"
-    echo "    oifname $docker_ifaces accept"
+    # Accept Docker and container bridge traffic (compatible with all nft versions)
+    echo '    oifname "docker0" accept'
+    echo '    oifname "br-+" accept'
+    echo '    oifname "docker_gwbridge" accept'
+    echo '    oifname "cni-+" accept'
     echo "    udp dport { 53, 123 } accept"
     echo "    tcp dport { 80, 443 } accept"
     [[ -n "${tcp_node}" ]] && echo "    tcp dport { $tcp_node } accept"
