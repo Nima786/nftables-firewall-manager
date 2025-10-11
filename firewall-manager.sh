@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =================================================================
-#  NFTABLES Firewall Manager v6.1 (Modular & Safe)
+#  NFTABLES Firewall Manager v6.1 (IPv6 Support Added)
 #  - Uses a modular include directory (/etc/nftables.d/) for safe coexistence.
 #  - Automatically configures the main nftables.conf file once.
 #  - Correctly detects SSH port using `sshd -T`.
