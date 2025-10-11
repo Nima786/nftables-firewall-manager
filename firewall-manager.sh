@@ -178,8 +178,6 @@ apply_rules(){
   tcp_node=$(sort -un "$ALLOWED_NODE_TCP_FILE" 2>/dev/null | paste -sd, - || true)
   udp_node=$(sort -un "$ALLOWED_NODE_UDP_FILE" 2>/dev/null | paste -sd, - || true)
 
-  local docker_ifaces="{ docker0, br-*, docker_gwbridge, cni-* }"
-
   if nft list table inet firewall-manager >/dev/null 2>&1; then
     nft delete table inet firewall-manager >/dev/null 2>&1 || true
   fi
