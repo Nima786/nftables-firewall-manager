@@ -502,7 +502,7 @@ main_menu(){
   while true; do
     clear
     echo "=========================================="
-    echo " NFTABLES FIREWALL MANAGER v6.0 (Modular)"
+    echo " NFTABLES FIREWALL MANAGER v6.1 (Modular)"
     echo "=========================================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
