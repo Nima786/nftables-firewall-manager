@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =================================================================
-#  NFTABLES Firewall Manager v6.1 (IPv6 Support Added)
+#  NFTABLES Firewall Manager v6.2 (IPv6 Support Added)
 #  - Uses a modular include directory (/etc/nftables.d/) for safe coexistence.
 #  - Automatically configures the main nftables.conf file once.
 #  - Correctly detects SSH port using `sshd -T`.
@@ -198,7 +198,7 @@ apply_rules(){
     echo "    iif lo accept"
     echo "    ct state invalid drop"
     echo "    icmp type { echo-request,echo-reply,destination-unreachable,time-exceeded,parameter-problem } accept"
-    echo "    icmpv6 type { echo-request, echo-reply, destination-unreachable, packet-too-big, time-exceeded, parameter-problem, neighbor-solicitation, neighbor-advertisement, router-solicitation, router-advertisement } accept"
+    echo "    icmpv6 type { echo-request, echo-reply, destination-unreachable, packet-too-big, time-exceeded, parameter-problem } accept"
     echo "    ip saddr @blocked_ips drop"
     echo "    ip6 saddr @blocked_ips_v6 drop"
     echo "    ip saddr @ssh_brute limit rate over 4/minute burst 5 packets drop"
@@ -502,7 +502,7 @@ main_menu(){
   while true; do
     clear
     echo "=========================================="
-    echo " NFTABLES FIREWALL MANAGER v6.1 (Modular)"
+    echo " NFTABLES FIREWALL MANAGER v6.2 (Modular)"
     echo "=========================================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
