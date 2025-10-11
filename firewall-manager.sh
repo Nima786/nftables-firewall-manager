@@ -1,5 +1,11 @@
 #!/bin/bash
 set -euo pipefail
+# --- ensure full script is loaded before running when piped ---
+if [ -p /dev/stdin ]; then
+  TMP=$(mktemp)
+  cat >"$TMP"
+  exec bash "$TMP"
+fi
 
 # =================================================================
 #  NFTABLES Firewall Manager v6.1 (IPv6 Enhanced)
