@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =================================================================
-#  NFTABLES Firewall Manager v6.2 (IPv6 Support Added)
+#  NFTABLES Firewall Manager v6.0 (Modular & Safe)
 #  - Uses a modular include directory (/etc/nftables.d/) for safe coexistence.
 #  - Automatically configures the main nftables.conf file once.
 #  - Correctly detects SSH port using `sshd -T`.
@@ -145,7 +145,6 @@ PY
   awk 'NF' "$tmp_pruned" | sort -u > "$tmp_unique"
   mv "$tmp_unique" "$tmp_pruned"
   nft flush set inet firewall-manager blocked_ips >/dev/null 2>&1 || true
-  set -e
   set +e
   local buf=() count=0
   while IFS= read -r net; do
@@ -189,17 +188,21 @@ apply_rules(){
   {
     echo "table inet firewall-manager {"
     echo "  set blocked_ips { type ipv4_addr; flags interval; }"
+    # IPv6 set added
     echo "  set blocked_ips_v6 { type ipv6_addr; flags interval; }"
     echo "  set ssh_brute { type ipv4_addr; flags dynamic,timeout; timeout 5m; }"
 
+    # INPUT Chain: Strict drop policy for maximum inbound security.
     echo "  chain input {"
     echo "    type filter hook input priority -10; policy drop;"
     echo "    ct state { established,related } accept"
     echo "    iif lo accept"
     echo "    ct state invalid drop"
     echo "    icmp type { echo-request,echo-reply,destination-unreachable,time-exceeded,parameter-problem } accept"
-    echo "    icmpv6 type { echo-request, echo-reply, destination-unreachable, packet-too-big, time-exceeded, parameter-problem } accept"
+    # Portable ICMPv6 core set (works on older nftables)
+    echo "    icmpv6 type { echo-request,echo-reply,destination-unreachable,packet-too-big,time-exceeded,parameter-problem } accept"
     echo "    ip saddr @blocked_ips drop"
+    # Mirror block for IPv6
     echo "    ip6 saddr @blocked_ips_v6 drop"
     echo "    ip saddr @ssh_brute limit rate over 4/minute burst 5 packets drop"
     echo "    tcp dport $ssh_port ct state new update @ssh_brute { ip saddr }"
@@ -209,19 +212,21 @@ apply_rules(){
     echo "    log prefix \"[NFT DROP in] \" flags all counter drop"
     echo "  }"
 
+    # FORWARD Chain: Strict drop policy to control container outbound traffic.
     echo "  chain forward {"
     echo "    type filter hook forward priority -10; policy drop;"
     echo "    ct state { established,related } accept"
     echo "    ct state invalid drop"
     echo "    ip saddr @blocked_ips drop"
-    echo "    ip6 saddr @blocked_ips_v6 drop"
     echo "    ip daddr @blocked_ips drop"
+    # IPv6 mirrors
+    echo "    ip6 saddr @blocked_ips_v6 drop"
     echo "    ip6 daddr @blocked_ips_v6 drop"
-    # Accept Docker and container bridge traffic (compatible with all nft versions)
-    echo '    oifname "docker0" accept'
-    echo '    oifname "br-+" accept'
-    echo '    oifname "docker_gwbridge" accept'
-    echo '    oifname "cni-+" accept'
+    # Older nftables compatibility: avoid set+wildcards
+    echo "    oifname \"docker0\" accept"
+    echo "    oifname \"br-+\" accept"
+    echo "    oifname \"docker_gwbridge\" accept"
+    echo "    oifname \"cni-+\" accept"
     echo "    udp dport { 53, 123 } accept"
     echo "    tcp dport { 80, 443 } accept"
     [[ -n "${tcp_node}" ]] && echo "    tcp dport { $tcp_node } accept"
@@ -229,9 +234,11 @@ apply_rules(){
     echo "    log prefix \"[NFT DROP fwd] \" flags all counter drop"
     echo "  }"
 
+    # OUTPUT Chain: Accept policy to ensure host/Docker stability.
     echo "  chain output {"
     echo "    type filter hook output priority -10; policy accept;"
     echo "    ip daddr @blocked_ips drop"
+    # IPv6 mirror
     echo "    ip6 daddr @blocked_ips_v6 drop"
     echo "  }"
 
@@ -243,7 +250,10 @@ apply_rules(){
       echo -e "${YELLOW}Loading blocklist into set (chunked)...${NC}"
       batch_load_blocklist
     fi
+    
     # --- START OF MODULAR PERSISTENCE LOGIC ---
+    # 1. Ensure the main config file is set up for modular includes.
+    # This is a self-healing check that runs every time.
     if ! grep -q 'include "/etc/nftables.d/\*\.nft"' /etc/nftables.conf 2>/dev/null; then
       echo -e "${YELLOW}Configuring /etc/nftables.conf for modular rules...${NC}"
       cat > /etc/nftables.conf <<EOF
@@ -253,6 +263,7 @@ include "/etc/nftables.d/*.nft"
 EOF
     fi
 
+    # 2. Save our rules to our dedicated file in the include directory.
     nft list table inet firewall-manager > "$OUR_RULES_FILE" 2>/dev/null || true
     # --- END OF MODULAR PERSISTENCE LOGIC ---
 
@@ -266,7 +277,6 @@ EOF
 }
 
 prompt_to_apply(){ apply_rules --no-pause; }
-
 
 # ---------------- Port helpers ----------------
 parse_and_process_ports(){
@@ -359,7 +369,7 @@ remove_ports_interactive(){ local proto="$1" ; local proto_file
 add_node_ports_interactive(){ local proto="$1" ; local proto_file
   [[ "$proto" == "TCP" ]] && proto_file="$ALLOWED_NODE_TCP_FILE" || proto_file="$ALLOWED_NODE_UDP_FILE"
   clear; echo -e "${YELLOW}--- Add Outbound ${proto} Ports (System/Nodes/APIs) ---${NC}"
-  echo "Current outbound ${proto}: $(sort -n "$proto_file" 2>/dev/null | paste -n -d, || echo "None")"
+  echo "Current outbound ${proto}: $(sort -n "$proto_file" 2>/dev/null | paste -s -d, || echo "None")"
   read -r -p "Enter ${proto} ports (e.g., 9012,9013 or 9000-9050): " input_ports < /dev/tty || true
   [[ -z "${input_ports:-}" ]] && return 0
   local changed; changed=$(parse_and_process_ports "add" "$proto_file" "$input_ports")
@@ -506,7 +516,7 @@ main_menu(){
   while true; do
     clear
     echo "=========================================="
-    echo " NFTABLES FIREWALL MANAGER v6.2 (Modular)"
+    echo " NFTABLES FIREWALL MANAGER v6.0 (Modular)"
     echo "=========================================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
