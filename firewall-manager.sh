@@ -188,6 +188,8 @@ apply_rules(){
   {
     echo "table inet firewall-manager {"
     echo "  set blocked_ips { type ipv4_addr; flags interval; }"
+    # NEW: IPv6 blocklist set (empty is fine; rules refer to it safely)
+    echo "  set blocked_ips_v6 { type ipv6_addr; flags interval; }"
     echo "  set ssh_brute { type ipv4_addr; flags dynamic,timeout; timeout 5m; }"
 
     # INPUT Chain: Strict drop policy for maximum inbound security.
@@ -197,7 +199,11 @@ apply_rules(){
     echo "    iif lo accept"
     echo "    ct state invalid drop"
     echo "    icmp type { echo-request,echo-reply,destination-unreachable,time-exceeded,parameter-problem } accept"
+    # NEW: allow essential ICMPv6 for ND/PMTU/ping
+    echo "    icmpv6 type { echo-request,echo-reply,destination-unreachable,packet-too-big,time-exceeded,parameter-problem,neighbour-solicitation,neighbour-advertisement,router-solicitation,router-advertisement } accept"
     echo "    ip saddr @blocked_ips drop"
+    # NEW: mirror block for IPv6
+    echo "    ip6 saddr @blocked_ips_v6 drop"
     echo "    ip saddr @ssh_brute limit rate over 4/minute burst 5 packets drop"
     echo "    tcp dport $ssh_port ct state new update @ssh_brute { ip saddr }"
     echo "    tcp dport $ssh_port accept"
@@ -213,6 +219,9 @@ apply_rules(){
     echo "    ct state invalid drop"
     echo "    ip saddr @blocked_ips drop"
     echo "    ip daddr @blocked_ips drop"
+    # NEW: mirror blocks for IPv6
+    echo "    ip6 saddr @blocked_ips_v6 drop"
+    echo "    ip6 daddr @blocked_ips_v6 drop"
     echo "    oifname $docker_ifaces accept"
     echo "    udp dport { 53, 123 } accept"
     echo "    tcp dport { 80, 443 } accept"
@@ -225,6 +234,8 @@ apply_rules(){
     echo "  chain output {"
     echo "    type filter hook output priority -10; policy accept;"
     echo "    ip daddr @blocked_ips drop"
+    # NEW: mirror block for IPv6
+    echo "    ip6 daddr @blocked_ips_v6 drop"
     echo "  }"
 
     echo "}"
