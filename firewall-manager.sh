@@ -1,11 +1,13 @@
 #!/bin/bash
-set -euo pipefail
-# --- ensure full script is loaded before running when piped ---
+
+# --- make it safe to run through "curl | bash"  ---
 if [ -p /dev/stdin ]; then
-  TMP=$(mktemp)
-  cat >"$TMP"
-  exec bash "$TMP"
+  tmp="$(mktemp)"
+  cat >"$tmp"               # read ENTIRE stream first
+  exec bash "$tmp" "$@"     # then start a new shell on the full file
 fi
+
+set -euo pipefail
 
 # =================================================================
 #  NFTABLES Firewall Manager v6.1 (IPv6 Enhanced)
