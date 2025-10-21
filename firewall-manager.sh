@@ -2,12 +2,14 @@
 set -euo pipefail
 
 # =================================================================
-#  NFTABLES Firewall Manager v6.1 (Modular & Safe)
+#  NFTABLES Firewall Manager v6.2 (Modular & Safe; IPv6 ports fixed; IPv4-only blocklist)
 #  - Uses a modular include directory (/etc/nftables.d/) for safe coexistence.
 #  - Automatically configures the main nftables.conf file once.
 #  - Correctly detects SSH port using `sshd -T`.
 #  - Ensures Docker stability with `OUTPUT policy accept`.
 #  - Provides maximum security with `INPUT` and `FORWARD` drop policies.
+#  - IPv6: Explicit accept rules added for your allowed ports (dual-stack).
+#  - Blocklist: IPv4-only by design (no IPv6 blocklist needed).
 # =================================================================
 
 # --- CONFIG ---
@@ -141,14 +143,21 @@ PY
     cp -f "$BLOCKED_IPS_FILE" "$tmp_pruned"
   fi
   [ -s "$tmp_pruned" ] || cp -f "$BLOCKED_IPS_FILE" "$tmp_pruned"
+
   local tmp_unique; tmp_unique=$(mktemp)
   awk 'NF' "$tmp_pruned" | sort -u > "$tmp_unique"
   mv "$tmp_unique" "$tmp_pruned"
+
   nft flush set inet firewall-manager blocked_ips >/dev/null 2>&1 || true
+
   set +e
   local buf=() count=0
   while IFS= read -r net; do
     [[ -z "$net" ]] && continue
+    # --- IPv4-only set: skip IPv6 entries defensively ---
+    if [[ "$net" == *:* ]]; then
+      continue
+    fi
     buf+=("$net"); ((count++))
     if (( count % chunk == 0 )); then
       local csv; csv=$(printf '%s,' "${buf[@]}" | sed 's/,$//')
@@ -186,8 +195,6 @@ apply_rules(){
   {
     echo "table inet firewall-manager {"
     echo "  set blocked_ips { type ipv4_addr; flags interval; }"
-    # IPv6 set added
-    echo "  set blocked_ips_v6 { type ipv6_addr; flags interval; }"
     echo "  set ssh_brute { type ipv4_addr; flags dynamic,timeout; timeout 5m; }"
 
     # INPUT Chain: Strict drop policy for maximum inbound security.
@@ -197,16 +204,23 @@ apply_rules(){
     echo "    iif lo accept"
     echo "    ct state invalid drop"
     echo "    icmp type { echo-request,echo-reply,destination-unreachable,time-exceeded,parameter-problem } accept"
-    # Portable ICMPv6 core set (works on older nftables)
-    echo "    icmpv6 type { echo-request,echo-reply,destination-unreachable,packet-too-big,time-exceeded,parameter-problem } accept"
+    # Portable ICMPv6 core + NDP types (helps SLAAC/RA/NS/NA)
+    echo "    icmpv6 type { echo-request,echo-reply,destination-unreachable,packet-too-big,time-exceeded,parameter-problem,nd-router-advert,nd-neighbor-solicit,nd-neighbor-advert } accept"
     echo "    ip saddr @blocked_ips drop"
-    # Mirror block for IPv6
-    echo "    ip6 saddr @blocked_ips_v6 drop"
     echo "    ip saddr @ssh_brute limit rate over 4/minute burst 5 packets drop"
     echo "    tcp dport $ssh_port ct state new update @ssh_brute { ip saddr }"
     echo "    tcp dport $ssh_port accept"
-    [[ -n "${tcp_in}" ]] && echo "    tcp dport { $tcp_in } accept"
-    [[ -n "${udp_in}" ]] && echo "    udp dport { $udp_in } accept"
+
+    # --- IMPORTANT: Dual-stack (IPv4 + IPv6) open-port rules ---
+    [[ -n "${tcp_in}" ]] && {
+      echo "    tcp dport { $tcp_in } accept"
+      echo "    ip6 nexthdr tcp tcp dport { $tcp_in } accept"
+    }
+    [[ -n "${udp_in}" ]] && {
+      echo "    udp dport { $udp_in } accept"
+      echo "    ip6 nexthdr udp udp dport { $udp_in } accept"
+    }
+
     echo "    log prefix \"[NFT DROP in] \" flags all counter drop"
     echo "  }"
 
@@ -217,9 +231,6 @@ apply_rules(){
     echo "    ct state invalid drop"
     echo "    ip saddr @blocked_ips drop"
     echo "    ip daddr @blocked_ips drop"
-    # IPv6 mirrors
-    echo "    ip6 saddr @blocked_ips_v6 drop"
-    echo "    ip6 daddr @blocked_ips_v6 drop"
     # Older nftables compatibility: avoid set+wildcards
     echo "    oifname \"docker0\" accept"
     echo "    oifname \"br-+\" accept"
@@ -227,8 +238,15 @@ apply_rules(){
     echo "    oifname \"cni-+\" accept"
     echo "    udp dport { 53, 123 } accept"
     echo "    tcp dport { 80, 443 } accept"
-    [[ -n "${tcp_node}" ]] && echo "    tcp dport { $tcp_node } accept"
-    [[ -n "${udp_node}" ]] && echo "    udp dport { $udp_node } accept"
+    # (tcp/udp here are inet and match both families; add ip6 variants if you want symmetry)
+    [[ -n "${tcp_node}" ]] && {
+      echo "    tcp dport { $tcp_node } accept"
+      echo "    ip6 nexthdr tcp tcp dport { $tcp_node } accept"
+    }
+    [[ -n "${udp_node}" ]] && {
+      echo "    udp dport { $udp_node } accept"
+      echo "    ip6 nexthdr udp udp dport { $udp_node } accept"
+    }
     echo "    log prefix \"[NFT DROP fwd] \" flags all counter drop"
     echo "  }"
 
@@ -236,8 +254,6 @@ apply_rules(){
     echo "  chain output {"
     echo "    type filter hook output priority -10; policy accept;"
     echo "    ip daddr @blocked_ips drop"
-    # IPv6 mirror
-    echo "    ip6 daddr @blocked_ips_v6 drop"
     echo "  }"
 
     echo "}"
@@ -514,7 +530,7 @@ main_menu(){
   while true; do
     clear
     echo "=========================================="
-    echo " NFTABLES FIREWALL MANAGER v6.1 (Modular)"
+    echo " NFTABLES FIREWALL MANAGER v6.2 (Modular)"
     echo "=========================================="
     echo "1) View Current Firewall Rules"
     echo "2) Apply Firewall Rules from Config"
